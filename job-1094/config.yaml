@@ -1,0 +1,88 @@
+prompt:
+  diff_mode: true
+  role_desc: >-
+    You are an expert engineer. Your task is to iteratively improve the provided
+    program.
+     Make sure that the changes you propose are consistent with each other. For example, if you refer to a new config variable somewhere, you should also propose a change to add that variable.
+     Suggest a new idea to improve the code that is inspired by your expert knowledge of optimization.
+  enable_reflector: false
+  program_template: |-
+
+    <program>
+     ${program}
+     </program>
+     <eval_result>
+     metrics:
+     ${metrics}
+     feedback:
+     ${feedback}
+     </eval_result>
+  user_message_template: |
+    <task_description>
+     ${task_description}
+     </task_description>
+
+     ${previous_trial}
+
+     <program_candidate>
+     ${program}
+     </program_candidate>
+
+
+
+
+     To achieve the task, please propose modifications to the program_candidate. Describe each change with a SEARCH/REPLACE block described as following:
+     <<<<<<< SEARCH
+     [Original code lines]
+     =======
+     [Modified code lines]
+     >>>>>>> REPLACE
+  always_the_best_in_diff: false
+sample:
+  num: 8
+  method: island
+islands:
+  num_islands: 5
+  reset_interval: 100
+  include_metrics:
+    - f1_score
+  migration_ratio: 0.1
+  population_limit: 40
+  migration_interval: 50
+  limit_all_population: false
+evaluation:
+  addrs:
+    - http://10.10.1.93:9000
+  metrics:
+    - name: f1_score
+      expected: 1
+      higher_is_better: true
+  cpu_bound: false
+  worker_nums: 10
+  timeout_secs: 600
+worker_nums: 5
+llm_ensemble:
+  - name: openrouter/anthropic/claude-sonnet-4
+    weight: 1
+  - name: vertex_ai/gemini-2.5-pro
+    weight: 1
+  - name: openrouter/x-ai/grok-4
+    weight: 1
+  - name: openai/gpt-4o
+    weight: 1
+custom_config:
+  prompt:
+    enable_reflector: false
+    always_the_best_in_diff: false
+  api_key: sk-3qUsDRiPEPyOsQbnD_C0lw
+  islands:
+    population_limit: 40
+    limit_all_population: false
+  model_name: gpt-4.1-mini
+  sample_nums: 500
+  train_data_path: >-
+    http://cloud.staging.p1.cn/v2/ai-raw/e2901005-5939-4b9f-ac56-5790b6a71560.parquet
+  webauth_username: chenzhiyang
+  validate_data_path: >-
+    http://cloud.staging.p1.cn/v2/ai-raw/153ecab0-213a-4d6b-9462-a469fe7c9697.parquet
+max_iterations: 1000

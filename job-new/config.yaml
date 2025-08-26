@@ -1,0 +1,149 @@
+prompt:
+  diff_mode: true
+  role_desc: >-
+    You are an expert engineer. Your final object is to complete the task
+    described in <task_description>, and you need to write a program to satisfy
+    these requirements.
+
+
+    Actually, you do not need to write it from blank, you can iteratively refine
+    a program. Here, we provide the python code in a previously tried program, and some other insights from other previous trials.
+
+
+    Now, suggest a new idea to improve the program, inspired by your expert
+    knowledge. You should think bravely to come up with new ideas. Make sure
+    that the changes you propose are consistent with each other. For example, if
+    you refer to a new config variable somewhere, you should also propose a
+    change to add that variable.
+
+
+    To achieve the task, You should start with the provided old version python code, and propose modifications to the program_candidate.
+    Describe each change with a SEARCH/REPLACE block described as following:
+
+
+    <<<<<<< SEARCH
+
+    [Original code lines]
+
+    =======
+
+    [Modified code lines]
+
+    >>>>>>> REPLACE
+  enable_reflector: false
+  user_message_template: |
+    def obtain_user_message(task_desc, parent_program, insights):
+        previous_trials = ""
+        for i, insight in enumerate(insights):
+            insight_reflection = insight[7]
+            insight_metrics = insight[6]
+            insight_program = insight[4]
+            intention_match = re.search(r'"""本次优化意图：(.*?)"""', insight_program, re.DOTALL)
+            if intention_match:
+                insight_intention = intention_match.group(1).strip()
+            else:
+                insight_intention = "调用一次大语言模型完成用户消息审核的最简单业务逻辑，仅用于最初跑通业务，后续需要优化。"
+            previous_trials += f"""<previous_trial_{i}>
+        - 在这一次尝试的过程中，撰写代码的原本目的和意图是：
+        {insight_intention}
+        - 在撰写代码并实际评测后，评测得到如下指标：
+        {insight_metrics}
+        我们将评测用例的输出与真实标签进行了对比，并用大语言模型进行了总结和反思，给出了如下反馈，可供参考：
+        {insight_reflection}
+        </previous_trial_{i}>\n\n"""
+
+
+        parent_program_program = parent_program[4]
+        parent_metrics = parent_program[6]
+        parent_feedback = parent_program[7]
+
+        parent_code = re.sub(r'"""本次优化意图：.*?"""', '', parent_program_program, flags=re.DOTALL).strip()
+
+        intention_match = re.search(r'"""本次优化意图：.*?"""', parent_program_program, re.DOTALL)
+        if intention_match:
+            parent_intention = intention_match.group(1).strip()
+        else:
+            parent_intention = "调用一次大语言模型完成用户消息审核的最简单业务逻辑。"
+
+        return f"""
+    {task_desc}
+
+    为了完成这一任务，我们曾经从不同角度开展了诸多代码修改尝试。在此，我们记录了多次尝试的意图计划，以及尝试之后得到的反馈结果。这些反馈中的分析和建议均由大语言模型给出，供你之后参考，你可以选择是否遵循这些建议。
+
+    {previous_trials}
+
+    现在，我们要以提升任务评测指标为目标，开始新一轮尝试。我们会基于以往的一版本代码，在其基础上通过 SEARCH/REPLACE BLOCK 修改以优化程序。
+    所基于的这一版本代码，前一次修改撰写的目的和意图是：
+    {parent_intention}
+    然后，在执行评测后，大语言模型对其评测结果进行了分析，给出了如下反馈意思，可供参考：
+    {parent_feedback}
+    
+    这一版本的原始代码是：
+    ```python
+    {parent_code}
+    ```
+
+    现在，请你根据这一版本的代码内容，这一版本原始的撰写意图以及执行后反馈，还有之前多次尝试及得到的反馈，综合分析并针对问题进行创新、发散性、有深度的思考后，告诉我你打算如何进行新一轮尝试：你需要告诉我新的轮尝试希望解决什么问题，有什么具体的解决方案。然后，用 SEARCH / REPLACE BLOCK 的格式告诉我，在上面提供的那一个版本的代码基础上，你要如何修改。
+
+    你的输出格式应该如下所示：
+    <think>
+    首先，在<think>部分，基于以上内容进行充分思考。
+    </think>
+    <intention>
+    然后，在<intention>标签内提出你打算如何进行新一轮尝试的目的和计划
+    </intention>
+    <modifications>
+    最后，在<modifications>标签内，提出具体的代码修改方案，确保每一个 SEARCH / REPLACE BLOCK 都可以用代码准确执行
+    </modifications>"""
+
+sample:
+  num: 8
+  method: island
+islands:
+  num_islands: 5
+  reset_interval: 100
+  include_metrics:
+    - f1_score
+  migration_ratio: 0.1
+  population_limit: 40
+  migration_interval: 50
+  limit_all_population: false
+evaluation:
+  addrs:
+    - http://10.10.1.177:9000
+    - http://10.10.1.142:9000
+    - http://10.10.1.220:9000
+    - http://10.10.1.162:9000
+    - http://10.10.1.54:9000
+  metrics:
+    - name: f1_score
+      expected: 1
+      higher_is_better: true
+  cpu_bound: false
+  worker_nums: 10
+  timeout_secs: 600
+worker_nums: 5
+llm_ensemble:
+  - name: openrouter/anthropic/claude-sonnet-4
+    weight: 1
+  - name: vertex_ai/gemini-2.5-pro
+    weight: 1
+  - name: openrouter/x-ai/grok-4
+    weight: 1
+  - name: openrouter/openai/gpt-5-chat
+    weight: 1
+custom_config:
+  prompt:
+    enable_reflector: false
+  api_key: sk-3qUsDRiPEPyOsQbnD_C0lw
+  islands:
+    population_limit: 40
+    limit_all_population: false
+  model_name: gpt-4.1-mini
+  sample_nums: 500
+  train_data_path: >-
+    http://cloud.staging.p1.cn/v2/ai-raw/e2901005-5939-4b9f-ac56-5790b6a71560.parquet
+  webauth_username: chenzhiyang
+  validate_data_path: >-
+    http://cloud.staging.p1.cn/v2/ai-raw/153ecab0-213a-4d6b-9462-a469fe7c9697.parquet
+max_iterations: 1000
