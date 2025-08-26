@@ -1,0 +1,108 @@
+## 任务目标
+你需要为牵手异性交友平台撰写完成**用户消息审查**这个业务的程序代码，使程序在这项业务上的判断和表现与人类审查员高度一致。
+以人类审查员提供的结果作为标注真值，你就需要提升程序预测结果的**f1 score**。
+
+
+你所实现的代码一定包括一个函数接口 `inference_function`。这个函数是审查业务的入口，函数签名如下：
+
+```python
+async def inference_function(
+        batch_idx: int,
+        df_input: pd.DataFrame,
+):
+    """
+    以 DataFrame 格式提供一条待审查数据，并以 DataFrame 格式返回审查结果
+
+    Parameters
+    ----------
+    batch_idx: int
+        Just a indicator what batch this is, for later gather the results
+
+    df_input: pd.DataFrame
+        The input data containing one row with three columns:
+            'id': (string) used to identify each sample
+            'comment': (string) one sentence that need to be judged if it violates the rules
+            'content': (string) the conversation context that this comment is in
+
+    Returns
+    -------
+    batch_idx: int
+        Just a indicator what batch this is, for later gather the results
+
+    df_output: pd.DataFrame or None
+        The processed output DataFrame with the same 'id' values as the input,
+        and 'predicted' column, 1 if violating the rule, 0 if normal
+        or None if the inference fails after multiple retries.
+    
+    quick_overview: string
+        a short setence describing how and why the inference_function get such a result
+    """
+```
+
+如果程序较为复杂，可以定义别的函数和变量。注意保持程序本身的自洽性（即可以成功运行）。
+
+在保证 `inference_function` 接口不变的情况下，请用任意方法提升 f1 score 。这些方法包括但不限于：构建带有思维链、Agent的大模型推理系统；结合符号规则分析与语义推理的复合系统，带有典型样例的RAG检索知识库...
+
+## f1 score 如何计算
+抽样 n 条用户消息数据作为输入，分别调用 inference_function 函数执行，然后解析输出的 DataFrame 。通过对比同一个 id 的预测结果 (predicted) 和人类审查员标注的真值, 计算准确率 precision 和召回率 recall
+最终的 f1_score = (2 * precision * recall) / (precision + recall)
+
+## 可用工具
+
+你可以选择在 inference_function 中调用以下函数：
+
+### 大模型API
+如果想用调用大模型，可以使用环境变量 `MODEL_NAME` 和 `OPENAI_API_KEY` 去调用 LLM 生成结果，调用 API 的 base url 是 `https://llm-api.p1.cn`。
+
+这是一段如何调用LLM API的代码示例：
+
+```python
+import os
+from openai import AsyncOpenAI
+
+async def label_by_llm(system_msg, user_msg):
+    client = AsyncOpenAI(
+        base_url='https://llm-api.p1.cn',
+        api_key=os.environ["OPENAI_API_KEY"],
+    )
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
+    response = await client.chat.completions.create(
+        model=os.environ["MODEL_NAME"],
+        messages=messages,
+        temperature=1.0, # 采样温度，可修改
+    )
+
+    output_text = response.choices[0].message.content
+    if output_text is None:
+        raise ValueError(f"response is None")
+    return output_text # 返回字符串
+```
+
+注意：如果需要，在 inference_function 函数中，你可以用各种灵活的方式修改 LLM 的调用逻辑，包括： LLM 的输入包括哪些内容、应该如何组织； LLM 的输出应该包括哪些内容，应该怎么解析；LLM 调用一次还是多次，是否需要为他提供额外工具。一般而言，大模型会更喜欢符合自然语言习惯、流畅的文本表述。
+
+### 文本向量化工具
+
+你可以假定有这样一个函数`get_embeddings`，可以向量化一个或多个字符串，得到其特征向量。其函数签名如下所示：
+```python
+def get_embeddings(
+    inputs: Union[str, Sequence[str]],
+    dim: Literal[2048, 1024, 512, 256] = 2048,
+    timeout: float = 30.0,
+) -> List[List[float]]:
+    """
+    Call Jarvis embeddings API and return vectors with the same length as inputs.
+
+    Args:
+        inputs: a single text or a list of texts
+        dim: keep only the first N dimensions; must be one of {2048, 1024, 512, 256}
+        timeout: request timeout in seconds
+
+    Returns: embedding vectors with the same length as inputs
+    """
+```
+一般而言，向量化可以方便地计算不同文本之间的相似程度。可以用于相似度排序、检索增强等方法中。
