@@ -1,0 +1,1527 @@
+import asyncio
+import os
+import random
+import re
+from dataclasses import dataclass
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+import requests
+from string import Template
+from alpha_evolve_evaluator.evaluator import BaseConfig, EvalResult
+import time
+import types
+import sys
+from asyncio import CancelledError
+import string
+from io import StringIO
+import logging
+from dataclasses import dataclass, field
+from typing import Tuple, Optional, List, Dict, Any, Union
+import traceback
+import numpy as np
+from openai import AsyncOpenAI, BadRequestError
+from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_not_exception_type, retry_if_exception_type, before_sleep_log
+
+from alpha_evolve_evaluator.dataset import Dataset, keep_columns
+from alpha_evolve_evaluator.utils import LoggingFileHandler
+from alpha_evolve_evaluator.tools import get_llm_client_wrapper, patch_get_llm_client
+import json
+
+sem = asyncio.Semaphore(400) 
+_logger = logging.getLogger(__name__)
+
+default_metrics = {
+    'f1_score': 0.0,
+    'precision': 0.0,
+    'recall': 0.0,
+    'labeled_ratio': 0.0,
+}
+
+DOCUMENT = """
+在牵手（该聊天平台的名称）的标注人员的培训手册上，标注了以下这些违规类型。这一培训资料可以用作参考，帮助你更好地理解人类审核员的评判标准。但我们不保证培训手册完全准确，如有冲突，以人类审核员提供的审核结果为准。
+
+违规类型：攻击党政反动分裂
+判断标准：涉政行为底线：
+1.宣扬、煽动有分裂意图及破坏国家统一的内容。例如：宣扬民族独立，煽动民族仇恨、民族歧视，破坏民族团结
+（1）台独/港独/疆独/藏独/蒙独/沪独等分裂言论和相关的事件报道和内容
+（2）涉及民族独立（台独/港独/疆独/藏独/蒙独/沪独）相关信息
+2.恶搞、丑化、侮辱、讽刺、否定领导人/英雄烈士/功勋人物事迹和精神、言论、行为等
+3.对底线敏感事件持支持、宣传、鼓励态度，或存在反政府、隐喻讽刺社会政策等相关内容
+4.宣扬、号召加入极端组织，例如ISIS、基地组织、纳粹及其他明令禁止的组织
+5.传播境外媒体/社交软件发布政治有害/可疑内容（与政府、社会、宗教、民族等相关的非正面内容）
+6.对底线敏感事件持支持、宣传、鼓励态度，或存在反政府、隐喻讽刺社会政策等相关内容。
+（1）涉港台抗议、游行、暴力等热点事件描述、转述、讨论内容（如香港占中、返送中、太阳花运动及其他）
+（2）涉反动暴乱性质相关的人物、网站、图书（64事件、法轮功、75事件、314事件、709律师及其他）
+详细管控名单@反动媒体 
+（3）散布谣言，煽动维权上访/群体性事件等聚众扰乱社会秩序，破坏社会稳定的行为（佳士工人维权、老兵维权及其他）
+
+违规类型：攻击党政反动分裂
+判断标准：涉政人物底线：
+1.恶搞、丑化、侮辱或讽刺在职/去职副部级以上领导 
+（1）讨论领导人及其家属相关的野史、内幕的内容 领导人家属 
+（2）以历史人物、历任皇帝隐喻、讽刺、攻击 在职/去职领导人
+（3）讽刺、调侃、恶搞部级领导人及国家执法机关的漫画内容
+2.歪曲、丑化、亵渎、否定英雄烈士/功勋人物事迹和精神，以侮辱、诽谤或者其他方式侵害英雄烈士/功勋人物
+功勋人物英雄烈士名录 
+3.底线/异见人士 —— 涉政人物底线（内部资料严禁外传，请遵守保密协议） 
+（1）台独/港独/疆独/藏独/蒙独/沪独相关人物
+（2）底线异见人士、敏感人物
+4.注册账号头像为在职/去职副国级以上领导人，一级主管部门领导人、有重大社会和舆论影响或副部级以上的落马官员"
+
+违规类型：违法
+判断标准：1.宣扬、引诱、吸食毒品，或展示实物毒品、描述吸毒细节、毒品效果
+2.代孕等违法行为
+3.传销性质微商（同公开信息名单）
+
+违规类型：索要红包礼物
+判断标准：站内站外向一位用户索要财物-借钱、索要红包，或提及交友涉及金钱交易和交换（特殊节日红包、批判驳斥及仅提及红包除外），例如：要外卖、加微信需要发红包（奖励）、要打车费、要化妆品、索要物品等情形同红包规则处理
+
+违规类型：向多人索要红包礼物
+判断标准：站内站外向多位（≥2）用户索要财物-借钱、索要红包，或提及交友涉及金钱交易和交换（特殊节日红包、批判驳斥及仅提及红包除外），例如：要外卖、加微信需要发红包（奖励）、要打车费、要化妆品、索要物品等情形同红包规则处理
+备注：
+①坐实：举报项有完整证据链（两个及以上不同用户）
+情况1：实锤举报 + 2条以上不同人的历史举报（必须是要红包、诈骗类型的举报标签）；情况2: 实锤举报 + 百条有1条以上站内要红包（不能与当前举报人为同一ID）
+②以上两种情况都需要满足不同举报人
+③仅请客吃饭类无法判断线上/线下的不做处罚，例如：请我吃饭（男用户不处罚，女用户正常处罚）
+④索要金额超3千元直接诈骗封禁
+⑤男方主动女方调侃性或玩笑语境下索要召回/人工不管控
+
+违规类型：金融诈骗
+判断标准：1.网投、网彩、时时彩、牛牛、龙虎、百家乐、北京28、加拿大28、赌球、竞猜等赌博性质的游戏、彩票、看走势、行情等（非实体店类彩票均ban）、影视宣发、影视传媒、非合法银行借贷拉客
+2.充电宝诈骗（向他人请求帮扫充电宝，到时不还）
+
+违规类型：未成年
+判断标准：明确表明自己是未成年人（18 岁以下），例如表明自己是高中生、初中生或16岁、17岁
+
+违规类型：已婚
+判断标准：被举报人聊天中提及自己已婚/分居中/冷静期等
+举报人提供明确证明对方已婚且在婚姻状态中证据，例如：结婚证、结婚照等
+如果召回为非单身不管控
+
+违规类型：泄密
+判断标准：聊天过程种表明自己为牵手恋爱/红娘员工，有以下任一情况：
+1.对公司业务进行详细描述
+2.产生威胁话语，或套取个人隐私
+
+违规类型：非本人账号
+判断标准：私聊中提及当前账号是非本人的，例如：这个是我家其他人的注册的；这个账号是我妹妹的或者其他人的
+表明给其他亲戚、朋友、同事找对象的，例如：我来帮我哥哥（姐姐）找对象
+
+违规类型：隐晦色情
+判断标准：1.随意评价对方的身材长相，例如：你好丰满、前凸后翘
+2.玩梗类的擦边行为，例如：萝莉有三宝，清纯，可愛，易推倒；空虚寂寞冷；处暧昧关系吧；
+3.星座相关的非指向性擦边形容词，例如：XX星座欲望大；XX星座喜欢找刺激
+4.非恶意色情图片，例如：聊天中出现微信背景黄图、绘画作品中出现黄色图片等（无漏点、非性行为生殖器图片）
+5.处男处女，讨论的目标不是对方或自己
+6.下腹部到敏感部位的图片、视频（仅限人工举报，召回不处罚）
+7.胸/屁股/舌头/脚此类敏感部位的夸赞（例：你的屁股练得好漂亮、你的脚很好看）
+8.口嗨类骚扰词：贪财好色；想入非非；见色起意；男性玩笑语境说自己是鸭子/男模；想男人/想女人；我想吃个嘴子/跟你接吻/跟你舌吻/邀约性亲嘴例如：有空亲个嘴吗/出来亲亲/出来吃个嘴子/出来接个吻；抱着睡/抱抱睡/那一起睡吧 （注意：聊天语境有邀约性质按规则处罚）
+常见色情提醒类词语：你腿好白啊；给他人讲黄色擦边笑话；骗你阳痿；屁股大生儿子； 得新冠会阳痿； 熬夜胸变小；你胸好；你屁股真翘；贪财好色
+提醒级别色情词汇召回给自见，人工举报提醒处罚
+
+违规类型：隐晦色情
+判断标准：1.前后语境容易引发色情联想的行为或有歧义的言语，例如：晚上一个人寂寞吗；带回家就不让你走了；班有我好上吗；我想和你去私人影院；喜欢做核酸吗；能和你玩玩吗；想男人了吗；我想跟你生孩子；你内衣是什么颜色；该大的地方大；我很色/你好色吗；我喜欢胸/屁股大的；你是来约炮的吗；活好吗；你约过吗；撕丝袜；聊聊男女之事；
+备注：色情联想类的语句需要结合前后语境来判断，不做过度联想
+2.讨论、形容敏感部位（腿、脚等），例如：看看腿（脚）；你穿丝袜吗；看看hs照可以吗；我是恋足癖（丝袜恋足类：人工举报处罚，关键词召回不处罚）
+3.婴幼儿生殖器、隐晦表情包：图没问题但是配的文字有隐晦色情内容
+4.约吗、做吗等无明显指向性的隐晦性邀约行为（百条里向≥3人发送此类会话，可直接升级禁言处理）
+5.讨论性观点例如：你怎么看待性；你觉得性和爱哪个更重要；我觉得性和谐很重要；你怎么看待两性关系；离婚这么久会性冷淡吗；
+6.sm类自述身份或者询问对方，例如：你是sub吗；我是字母圈的  备注sm类：如果用户是因为举报人先发送容易引发联想的语句导致被召回，不做处罚
+备注：1.若百条内能确认用户玩软件的目的是yp、找py等，可升级ban处罚 2.若警告级别色情词刷屏≥3人可升级禁言处罚；
+
+违规类型：轻度色情
+判断标准：1.发未露生殖器的低俗类图片/视频
+2.发色情暗示的音频信息，如：娇喘、叫床、色情片音频片段等
+3.涉及隐晦金钱的邀约，如：500块钱出来约吗；
+4.询问对方性生活历史或大尺度描述自身性生活历史的行为：
+（和几个男人睡过；你多久没做爱了；恋爱经验多少，发生性关系了嘛；我 3 年没性生活了；之前睡过一个很软的妹子；你做爱喜欢什么姿势；你还是处女吗；我还是处男）
+5.询问对方/阐述自己性能力/性癖的行为：
+（你喜欢性欲强比较的男生么；你能做我的狗/主人吗；你多高多重什么cup啊；你胸多大；让你舒服，我是绿帽癖，送裸露生殖器或明显性行为的图下面18cm，看看胸/屁股）
+6.聊骚/描述色情行为/暗示想发生性关系的行为
+（那可以色色嘛；都脱掉那样打；分手是因为他下面不够大吗；想摸摸大腿根；想舔你的脚；你看着好骚；馋你身子；试婚/试爱；能接受炮友吗、素睡、晨勃了、来酒店找我吗；我年龄小，但我下面不小）
+7.双方你情我愿聊骚时发送的黄图（男女露点、勃起内裤照、性行为、女性乳晕）
+8.SM类（皮鞭、手铐）、润滑油、情趣内衣（未穿着状态）
+9.你情我愿聊天发送低俗类图片召回自见
+
+违规类型：重度色情
+判断标准：1.发送裸露生殖器或明显性行为的图片/视频（男女生殖器、勃起内裤照、性行为）
+2.提供性交易场所、性交易工作者、色情服务（如：原味、丝足、卖淫、援交、坐台、出台、有偿约、福利姬、前列腺按摩、男公关及其他）
+3.进行招嫖、找小姐、招聘鸡鸭等行为（被动招嫖不管）
+4.发布成人av电影、色情直播、情色片、三级片、偷拍走光露点相关的广告信息，包括视频、图片、链接、联系方式（索要网址给警告）
+5.聊天中明确表示自己是约炮、找情人、包养的交友意图
+（我就直说了，需要被包养吗；YP 吗；约酒店嘛，想和你睡；想找个长期固定py）
+6.明确的性邀约行为（包括找 3p、换妻、单男、多人淫乱、人兽、乱伦的）
+（3p考虑吗；文爱吗；2000过夜可以吗；裸聊吗；我只想找生理/肉体上的陪伴，你愿意吗）
+7.聊天中存在冒犯性/挑逗性的文字或性行为描述：明确摸、舔、吸等行为&目标是胸、生殖器等敏感部位
+（可以坐我脸上吗，想舔你下面；你下面的小洞能不能让咱们小家伙热乎热乎；我在打飞机）
+8.自慰类（跳蛋、飞机杯）、刺激类（龟头冠状沟环、阴茎外套）、充气娃娃、避孕套等情趣用品图片
+9.询问对方/阐述自己性器官的行为
+（我JB很大你能接受么；你小穴水多不多；想试试你下面的洞紧不紧）
+10.当前举报为色情警告基础上，用户在百条向≥3人发送构成色情警告处罚的会话，可直接升级ban处理（除当前举报外，无需区分是否你情我愿）
+11.站外色情举报合理且为色情警告基础以上（除你情我愿聊崩）并且站内出现刷屏引流行为
+12.确定用户为人妖/CD /TS /伪娘等此类人群不区分男号女号注册
+13.从事成人用品、两性保健品
+
+
+违规类型：判罚标准
+判断标准：双方你情我愿相互使用色情低俗语音、文字等内容进行交流不做处罚
+女方先表明自己不找对象（或资料存在擦边低俗类内容）而引发男方询问能否约炮等骚扰行为被举报的不处罚
+备注：需要明确识别为双方在相互撩骚，如果是单方面，则正常按照色情规则处置
+已召回部分不再重复处罚
+
+违规类型：轻度广告
+判断标准：以曝光产品或服务为目的：
+1.表明职业并曝光产品或服务带有营销信息
+2.产品标识/名称+产品信息介绍
+3.宣传话术/引导性话术
+4.免费赠送产品、或诱导关注赠送产品等
+5.诱导至其他app（单次发送警告处罚，向≥3人发送链接或引导下载可直接广告封号）
+6.介绍产品功能同时有联系方式（包含支付宝、微信等及其他收款码类）
+7.明确有拉客行为的用户，例如：购买联系我（普通商业广告）
+8.明确为陪玩职业
+备注：聊天过程中提及自己的身份为：保险、微商、销售、客服（销售类型）、培训班老师、房产中介、客户经理及其他带有销售性质的职业不管控
+
+违规类型：严重广告
+判断标准：有贩卖行为（除表明自己是购买方）：
+1.明确酒吧、KTV、夜场夜店工作，出现拉客营销行为广告或确定为营销、ktv公主（不涉及钱色交易的）
+2.明确招代理、招加盟
+3.从事成人用品、两性保健品
+4.平台+邀请码内容。明确写明是邀请码
+5.网络兼职：刷单、打字、韵聊引流、任务引流及其他需要在家或通过线上完成的赚钱任务
+6.减肥广告（描述自己减肥成功向其他人分享自己的减肥老师）
+7.麻将托、酒托、饭托（酒托饭托向多个用户发送同一位置）、仙侠类游戏托（王者荣耀，吃鸡等常见手游不算）、情趣用品托（引导用户在指定售卖机中购买）、台球助教从业者；备注：带图举报 + 2条以上不同人的历史举报（必须是诈骗类型的举报标签）
+8.竞品类出现拉客行为
+9.明确来平台目的为拓展客户
+10.陪玩拉客营销行为
+11.台球助教或台球拉客营销
+12.足疗、spa、按摩拉客行为
+
+违规类型：引流
+判断标准：话术类引流：
+1.直接或间接导流至其他平台。例如：加了吗，加了告诉我/我心情不好加微信/失恋了加微信/遇到渣男了加微信/加了说一下/你多大了我们加qq吧（向多个账号（≥3）发送）
+2.一个账号多次发送多个（两个及以上）同平台社交账号，例如：用户有多个微信号且聊天重复多次
+3.主动向其他用户索要联系方式，但不透露自己的联系方式（刷屏比例达70%）
+
+违规类型：引流
+判断标准：非话术且社交账号类刷屏：
+1.全社交账号或导流语言刷屏（90% 以上内容），如掺杂无意义类内容也算入【限女性，男性纯引流文本/图片/语音达到90%才可封禁】
+2.向≥3人说自己是主播且有社交账号引流行为
+
+违规类型：引流
+判断标准：向多个账号（≥3）发送：
+1.快手，抖音号等刷屏（补充话术是否所有其他社交平台账号）
+2.助力、分红包其他合理平台，未涉及其他用户个人利益的链接地址。例如：拼多多邀请砍单、花小猪邀请砍单类
+备注：如刷屏比例达90%可按非话术引流规则广告封号
+
+违规类型：nan
+判断标准：引流刷屏比例50%—90%
+
+违规类型：轻度辱骂
+判断标准：1.阴阳怪气、恶意调侃类词汇
+例：高冷给谁看呢？；真下头、真晦气；X你妹、X个der（X不能为操、日等性行为动词）；哪来的优越感？；你不配；跟你有球关系？；不会说话就闭嘴；你真能装；不太喜欢河南的；你有一点矮；小老婆；小情人
+2.对社会背景（工作、学校、学历、收入等）负面评价，例：你这么点收入还想养我？；就你这样也能当博士？；就这素质还老师呢？
+3.非恶意针对外貌攻击，性别攻击例：你嘴长的有点奇怪；你眼睛有点小；你是男是女；你长的又不是特别好看；
+4.非针对对方辱骂攻击，仅针对对方提出的问题进行贬低，例：你怎么会问这么弱智的问题？
+5.小胖/小笨蛋/小丑鱼/小傻子等类似于亲密爱称召回不处罚，人工举报给提醒
+6.滑了为什么不说话/不说话就别滑/不说话你匹配什么召回自见，人工举报不处罚
+备注：当提醒类语句+脏话口头语，升级为警告处罚，例：你他妈配吗？；真他妈下头
+
+违规类型：重度辱骂
+判断标准：使用脏话、侮辱性、恶意低俗粗鄙的词汇，有指向性的诅咒、谩骂他人，如：你妈死了、死全家、给我滚远点（口头语及非针对举报人的除外）
+备注：口头语，语气词——不处罚；包括但不限于：沃日、他妈的、傻逼等
+1.叫嚣让对方去死或者患上严重疾病或残疾，例如：祝你死全家、神经病
+2.性相关的贬低、辱骂，例如：装逼、傻逼、骚逼、不要逼脸、你必得艾滋
+3.涉及动作+家人的贬低、诅咒，例如：你是狗娘养的、我是你爸爸、儿子真乖
+4.对外貌、生理特征、年龄等负面评价，例如：你30长得像40岁一样；你个死胖子；你太丑了；你个老女人；你眼瞎啊？；你这身高和残疾没区别；
+5.通过贬低他人无性生活实施攻击
+6.诅咒他人在今后的情感上有缺失、严重诅咒他人例如：找不到对象、一辈子一个人、永远孤单寂寞、生孩子没屁眼、已读不回生不了小孩
+备注：开玩笑或者合理场景除外，例如：那你真的打算这辈子不结婚了？
+7.给他人发送引人不适的内容，例如恐怖视频、排泄物等
+8. 对人的智商攻击，例如：智障、脑残、白痴、你脑子没事吧？
+9. 把人和动物做对比，你是狗，你是猪
+10.把人和污秽物、排泄物做对比，例如：你这个搅屎棍、你个垃圾
+11.涉及地域攻击，例如：你果然是个农村佬；河南就是骗子多；
+
+违规类型：重度辱骂
+判断标准：1.宣称对方参与性行为的辱骂，例如：活该被操、干你下面
+2.利用性相关身份去贬低他人，例如：婊子、妓女、你/你妈是出来卖B的吧
+3.站外给对方发送辱骂轰炸短信等恶劣骚扰行为（如无法分辨哪一方先出现不友善行为，可先看站内举报方是否存在挑衅或先辱骂行为，若没有此类行为，可按站外证据直接处罚）
+4.造他人黄谣，例如：我朋友跟你睡过
+
+违规类型：重度辱骂
+判断标准：频繁恶意辱骂：
+百条信息中出现三次及三次以上对不同用户出现的辱骂或不友善行为（无差别攻击，对应三个及以上不同接收id）
+
+违规类型：判罚标准
+判断标准：单方面辱骂：人工举报-按尺度最严重那条处罚，召回举报——辱骂内容如属于提醒处罚范围内按自见处理，其他级别不变
+双方互骂：人工举报——按照此段最严重的标签处罚，召回举报——自见
+已召回部分不再重复处罚
+
+违规类型：其他辱骂情况
+判断标准：1.举报人发布骚扰内容导致被女性回击辱骂：
+（1）亲密类称呼或试图建立关系，例如：宝贝、老婆、媳妇、宝宝、亲爱的、能做我老婆吗
+备注：一些泛用类词汇除外：小姐姐、小仙女、小可爱、美女、亲等
+（2）女性胸部、屁股、腿、脚部位正面评价或提及，例如：你胸多大
+（3）发送冒犯类内容：来我被窝里睡吧、想看看对方敏感部位（非色情）、对找对象问题一再追问、晚上一起玩、能亲你吗
+（4）发送有性暗示类内容或者试图把话题往色情方面引导（可能和上条有重合），例如：分手是因为他不够大吗；班有我好上吗
+2.辱骂公司平台行为
+"""
+RAW_PROGRAM = ""
+SYSTEM_TEMPLATE = """
+你是一名审核系统优化助手，正在为一个用户聊天行为审核程序分析其审核结果并提出总结与建议，以助于该程序能够获得下一步的开发优化。程序的目标是审查用户在牵手异性交友平台上聊天时，某一句指定聊天内容是否存在违规行为。违规样本应该被判定为正样本 (1, positive) ，正常样本应该被判定为负样本 (0, negative) 。程序开发的最终目标应当与人类审核员的审核结果高度对齐，从而能代替人类审核员直接开展审核工作。
+
+{DOCUMENT}
+
+**你的任务是：**完整阅读当前程序、程序设计意图、评估指标、以及全部样例（含TP/FP/TN/FN）**之后，给出一份**包括代表性示例样本以及反思内容的报告**，用于指导下一步程序优化。**
+
+【任务目标】
+1. 根据评估指标（如 F1、precision、recall 等）和四类候选样本，找出最能暴露模型误报/漏判瓶颈的代表性样本。
+2. 仅输出严格的 JSON（不得包含额外文本、Markdown 或代码围栏）。
+3. 对样本选择进行分析，必须给出：
+   - reflection：
+    1) 判断当前版本是否落实了“程序设计意图”，是否在正确的问题上发力。
+    2) 结合评估指标与全部样例，定位主要误报/漏判来源与成因（规则缺陷/上下文缺失/关键词过敏/对政策边界理解不一致等）。
+    3) 结合样例中可复现的模式，给出**具体、可操作**的优化建议（算法/检索策略/Prompt/案例覆盖/阈值/后处理）。
+    4) 评估这条改进路线的可行性与预期收益/风险，说明应优先改什么。
+
+【四类反馈定义】
+- False Positive：实际正常、预测违规（误报）
+- False Negative：实际违规、预测正常（漏判）
+- True Positive：实际违规、预测违规
+- True Negative：实际正常、预测正常
+
+【输出格式——必须严格为 JSON】
+仅输出一个 JSON 对象，格式固定为：
+{
+  "reflection": "<string>",
+  "False Positive": { "count": <int>, "items": [<string>, ...] },
+  "False Negative": { "count": <int>, "items": [<string>, ...] },
+  "True Negative": { "count": <int>, "items": [<string>, ...] },
+  "True Positive": { "count": <int>, "items": [<string>, ...] }
+}
+
+【硬性要求】
+- count 必须与 items 长度一致。
+- items 中的内容必须与输入样例严格对应，不能随意改写或者简写，需要包括示例样本id,消息所在对话,模型预测内容,模型预测结果,正确答案等信息。
+- 给出的建议必须具体且可操作，不能泛泛而谈，应该可以被开发人员直接理解和执行，越具体越好。
+- 不得输出 null、None、True/False 等非字符串；不得省略 reflection。
+"""
+tmpl = Template(SYSTEM_TEMPLATE.replace("{DOCUMENT}", "$DOCUMENT"))
+SYSTEM_TEMPLATE = tmpl.substitute(DOCUMENT=DOCUMENT)
+
+_CANON_KEYS = {
+    "False Positive": {"False Positive", "falsepositive", "false_positive", "false-positive", "false positive", "fp"},
+    "False Negative": {"False Negative", "falsenegative", "false_negative", "false-negative", "false negative", "fn"},
+    "True Positive":  {"True Positive", "truepositive",  "true_positive",  "true-positive",  "true positive",  "tp"},
+    "True Negative":  {"True Negative", "truenegative",  "true_negative",  "true-negative",  "true negative",  "tn"},
+    "reason":         {"reason", "原因", "Reason"},
+    "suggestion":     {"suggestion", "建议", "recommendation", "recommendations", "Recommendation", "Suggestion"},
+    "reflection":     {"reflection", "反思", "Reflection"},
+}
+
+def _extract_xml_safe(text: Optional[str], tag: str) -> Optional[str]:
+    if not text:
+        return None
+    pat = re.compile(rf"<{tag}>(.*?)</{tag}>", re.DOTALL)
+    m = pat.search(text)
+    return m.group(1).strip() if m else ""
+
+def make_insight_from_program_row(row: dict) -> dict:
+    """
+    输入 row: {"id":..., "parent_id":..., "program": "...", 可选 "feedback": "...", 可选 "metrics": {...}}
+    输出 Insight 可用：
+      {"feedback": "<executor_program>..</executor_program><executor_feedback>..</executor_feedback>",
+       "metrics": {...}}
+    """
+    prog = row.get("program") or ""
+    fb_raw = row.get("feedback") or ""
+    prog_in_fb = _extract_xml_safe(fb_raw, "executor_program")
+    fb_in_fb = _extract_xml_safe(fb_raw, "executor_feedback")
+    executor_program = prog_in_fb or prog
+    executor_feedback = fb_in_fb or (fb_raw or "")
+    wrapped = (
+        f"<executor_program>\n{executor_program}\n</executor_program>\n"
+        f"<executor_feedback>\n{executor_feedback}\n</executor_feedback>"
+    )
+    return {"feedback": wrapped, "metrics": (row.get("metrics") or {})}
+
+def _shorten(s: Optional[str], cap: int) -> str:
+    s = s or ""
+    return s if len(s) <= cap else (s[: cap - 3] + "...")
+
+
+@dataclass
+class LLMInsightSelector:
+    parent_program_code: str
+    all_programs: List[Dict[str, Any]]          # conf.custom_config["all_programs"]
+    llm_client: AsyncOpenAI
+    model_name: str = "fallback/gpt-4.1-mini"
+    temperature: float = 0.2
+    max_rounds: int = 12
+    max_select: int = 8
+    page_size: int = 50
+
+    def __post_init__(self):
+        self._id2row: Dict[int, Dict[str, Any]] = {}
+        for r in self.all_programs:
+            pid = r.get("id")
+            if isinstance(pid, int):
+                self._id2row[pid] = r
+        self._selected_ids: List[int] = []
+
+    # ---------- 三个工具规格 ----------
+
+    @property
+    def tools_spec(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_candidate_ids",
+                    "description": "列出候选 program 的 id（可选带 parent_id）用于浏览。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "offset": {"type": "integer", "minimum": 0},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                            "with_parent": {"type": "boolean"},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_programs_by_ids",
+                    "description": "查看指定 id 的parent_id, executor_program, executor_feedback以及metrics详情。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 50},
+                        },
+                        "required": ["ids"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "add_to_selection",
+                    "description": "将若干 id 加入最终输出（最多 8 个，自动去重，不存在会忽略）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 50},
+                        },
+                        "required": ["ids"],
+                    },
+                },
+            },
+        ]
+
+    # ---------- 三个工具实现 ----------
+
+    def _tool_list_candidate_ids(self, offset: int = 0, limit: int = 50, with_parent: bool = True) -> List[Dict[str, Any]]:
+        offset = max(0, int(offset or 0))
+        limit = max(1, min(int(limit or self.page_size), 200))
+        rows = self.all_programs[offset: offset + limit]
+        if with_parent:
+            return [{"id": int(r.get("id")), "parent_id": r.get("parent_id")} for r in rows if isinstance(r.get("id"), int)]
+        return [{"id": int(r.get("id"))} for r in rows if isinstance(r.get("id"), int)]
+
+    def _tool_get_programs_by_ids(self, ids: List[int]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for pid in ids or []:
+            row = self._id2row.get(int(pid))
+            if not row:
+                continue
+            out.append({
+                "id": int(row.get("id")),
+                "parent_id": row.get("parent_id"),
+                "executor_program":_extract_xml_safe(row.get("feedback",""), "executor_program"),
+                "executor_feedback":_extract_xml_safe(row.get("feedback",""), "executor_feedback"),
+                "metrics": row.get("metrics") or {},
+            })
+        
+        return out
+
+    def _tool_add_to_selection(self, ids: List[int]) -> Dict[str, Any]:
+        already = set(self._selected_ids)
+        for pid in ids or []:
+            if len(self._selected_ids) >= self.max_select:
+                break
+            if not isinstance(pid, int):
+                continue
+            if pid not in self._id2row:
+                continue
+            if pid in already:
+                continue
+            self._selected_ids.append(pid)
+            already.add(pid)
+        return {
+            "selected_ids": self._selected_ids,
+            "remaining_slots": max(0, self.max_select - len(self._selected_ids)),
+        }
+
+    def _dispatch_tool(self, name: str, arg_json: str) -> str:
+        try:
+            args = json.loads(arg_json or "{}")
+        except Exception:
+            args = {}
+        try:
+            if name == "list_candidate_ids":
+                data = self._tool_list_candidate_ids(
+                    int(args.get("offset", 0) or 0),
+                    int(args.get("limit", self.page_size) or self.page_size),
+                    bool(args.get("with_parent", False)),
+                )
+            elif name == "get_programs_by_ids":
+                raw_ids = args.get("ids") or []
+                ids = [int(x) for x in raw_ids if isinstance(x, (int, float, str))]
+                data = self._tool_get_programs_by_ids(ids)
+            elif name == "add_to_selection":
+                raw_ids = args.get("ids") or []
+                ids = [int(x) for x in raw_ids if isinstance(x, (int, float, str))]
+                data = self._tool_add_to_selection(ids)
+            else:
+                data = {"error": f"unknown tool: {name}"}
+        except Exception as e:
+            data = {"error": f"tool {name} failed: {e}"}
+        return json.dumps(data, ensure_ascii=False)
+
+    @property
+    def system_prompt(self) -> str:
+        return (
+            "你是一名严谨的代码进化 Insight 选择助手。"
+            "你的任务是从候选程序中筛选出少量真正有助于改进 parent_program 的高价值样本。"
+            "在挑选过程中必须遵循：逐步浏览 -> 谨慎评估 -> 谨慎添加 -> 最终收敛。"
+        )
+
+    @property
+    def user_prompt(self) -> str:
+        return f"""
+<任务目标>
+你需要从过往 programs 中挑选出**最有助于改进当前 parent_program**的少量样本（最多 {self.max_select} 个）。
+这些样本将用于后续的代码优化，因此每个入选样本都必须具有明确的改进启发意义。
+
+这些program完成的任务是牵手平台的用户聊天内容标注任务，违规样本应该被判定为正样本 (1, positive) ，正常样本应该被判定为负样本 (0, negative) 。
+
+这些样本包括完整的 program 代码、执行反馈和评测指标（如有）。你需要综合考虑这些信息，确保所选样本能够为 parent_program 的改进提供实质性帮助。
+
+<具体任务要求>
+1. 首先对候选样本进行**广泛浏览**，建立对整体分布的认识；
+2. 然后对部分候选样本进行**重点查看**，理解其 program 逻辑；
+3. 对比 parent_program，判断样本是否能提供**可迁移的改进启发**，或者根据其parent_program的缺陷进行补充；
+4. 仅当有充分理由时，才调用 add_to_selection 将其加入最终选择；
+5. 始终保持**严格的数量控制**，总数不得超过 {self.max_select}；
+6. 避免冗余，选择时要确保样本之间有差异性和互补性。
+
+<评估依据>
+- 对当前 parent_program 的迁移价值（是否能直接指导 diff/重构）；
+- 去冗余：避免相似或价值重复的样本。
+
+<当前 parent_program>
+```python
+{self.parent_program_code}
+</当前 parent_program>
+
+<可用工具>
+
+list_candidate_ids(offset, limit, with_parent)：浏览候选 id（可带 parent_id），其中offset表示起始位置，limit表示返回数量（上限 200），with_parent 表示是否返回 parent_id
+get_programs_by_ids(ids)：查看指定 id 的详细代码以及反馈（id,parent_id,executor_program，executor_feedback,metrics）
+add_to_selection(ids)：将若干 id 加入最终输出（上限 {self.max_select}） </可用工具>
+<操作规范>
+
+可以多次调用 list_candidate_ids 与 get_programs_by_ids 进行充分浏览与比对；
+只有当确定样本对改进有实际价值时，才调用 add_to_selection；
+总数必须 ≤ {self.max_select}；
+当你完成挑选后，立即停止进一步操作。 </操作规范> """.strip()
+
+    def _build_messages(self) -> List[Dict[str, Any]]: return [ {"role": "system", "content": self.system_prompt}, {"role": "user", "content": self.user_prompt}, ]
+
+    async def run(self) -> List[Dict[str, Any]]: 
+        messages = self._build_messages()
+        for _ in range(self.max_rounds):
+            resp = await self.llm_client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=self.temperature,
+                tools=self.tools_spec,
+                tool_choice="auto",
+            )
+
+            msg = getattr(resp.choices[0], "message", None)
+            if msg is None:
+                messages.append({"role": "assistant", "content": "（空响应）"})
+                continue
+
+            assistant_msg: Dict[str, Any] = {"role": "assistant"}
+            if getattr(msg, "content", None):
+                assistant_msg["content"] = msg.content
+            if getattr(msg, "tool_calls", None):
+                assistant_msg["tool_calls"] = msg.tool_calls
+            messages.append(assistant_msg)
+
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            if tool_calls:
+                for tc in tool_calls:
+                    out = self._dispatch_tool(tc.function.name, tc.function.arguments or "{}")
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
+                if len(self._selected_ids) >= self.max_select:
+                    break
+                continue
+
+            if len(self._selected_ids) >= max(1, min(self.max_select, 8)):
+                break
+
+        insights: List[Dict[str, Any]] = []
+        for pid in self._selected_ids:
+            row = self._id2row.get(pid)
+            if not row:
+                continue
+            insights.append(make_insight_from_program_row(row))
+        return insights
+
+def _normalize_key(k: str) -> str:
+    if not isinstance(k, str):
+        k = str(k)
+    k = k.strip().lower()
+    k = k.replace("_", "").replace("-", "").replace(" ", "")
+    return k
+
+def _find_key(obj: Dict[str, Any], target: str) -> Any:
+    wanted = _CANON_KEYS[target]
+    for k, v in obj.items():
+        nk = _normalize_key(k)
+        if nk in { _normalize_key(w) for w in wanted }:
+            return v
+    return None
+
+def _coerce_block(val: Any) -> Dict[str, Any]:
+    items: List[str] = []
+
+    # dict
+    if isinstance(val, dict):
+        raw_items = val.get("items", [])
+        if isinstance(raw_items, list):
+            items = [str(x) for x in raw_items]
+        elif isinstance(raw_items, str):
+            items = [s for s in re.split(r"\n{2,}", raw_items.strip()) if s.strip()]
+        else:
+            items = [str(raw_items)]
+        cnt = val.get("count", len(items))
+        try:
+            cnt = int(cnt)
+        except Exception:
+            cnt = len(items)
+        cnt = len(items) if cnt != len(items) else cnt
+        return {"count": cnt, "items": items}
+
+    if isinstance(val, list):
+        items = [str(x) for x in val]
+        return {"count": len(items), "items": items}
+
+    if isinstance(val, str):
+        s = val.strip()
+        try:
+            parsed = json.loads(s)
+            return _coerce_block(parsed)
+        except Exception:
+            pass
+        parts = [p for p in re.split(r"\n{2,}", s) if p.strip()]
+        return {"count": len(parts), "items": parts}
+
+    return {"count": 1, "items": [str(val)]}
+
+def normalize_selected_feedback(selected_feedback_obj: Any) -> Dict[str, Any]:
+    if isinstance(selected_feedback_obj, str):
+        try:
+            selected_feedback_obj = json.loads(selected_feedback_obj)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", selected_feedback_obj)
+            if m:
+                try:
+                    selected_feedback_obj = json.loads(m.group(0))
+                except Exception:
+                    selected_feedback_obj = {}
+            else:
+                selected_feedback_obj = {}
+
+    if not isinstance(selected_feedback_obj, dict):
+        selected_feedback_obj = {}
+
+    fp_val = _find_key(selected_feedback_obj, "False Positive")
+    fn_val = _find_key(selected_feedback_obj, "False Negative")
+    tn_val = _find_key(selected_feedback_obj, "True Negative")
+    tp_val = _find_key(selected_feedback_obj, "True Positive")
+
+    fp = _coerce_block(fp_val) if fp_val is not None else {"count": 0, "items": []}
+    fn = _coerce_block(fn_val) if fn_val is not None else {"count": 0, "items": []}
+    tn = _coerce_block(tn_val) if tn_val is not None else {"count": 0, "items": []}
+    tp = _coerce_block(tp_val) if tp_val is not None else {"count": 0, "items": []}
+
+    # 纠正 count 与 items 长度不一致
+    for block in (fp, fn, tn, tp):
+        if not isinstance(block.get("items"), list):
+            block["items"] = [str(block.get("items"))]
+        block["items"] = [str(x) for x in block["items"]]
+        block["count"] = len(block["items"])
+
+    # 提取 reason / suggestion（含中文别名）
+    def _get_text_field(target: str) -> str:
+        val = _find_key(selected_feedback_obj, target)
+        if isinstance(val, (list, dict)):
+            # 若模型误把文本写成 list/dict，转成紧凑字符串
+            try:
+                return json.dumps(val, ensure_ascii=False)
+            except Exception:
+                return str(val)
+        return str(val) if val is not None else ""
+
+    reflection = _get_text_field("reflection")
+
+    return {
+        "False Positive": fp,
+        "False Negative": fn,
+        "True Negative": tn,
+        "True Positive": tp,
+        "reflection": reflection,
+    }
+
+
+def setup_stdout_logging(log_level: str='INFO', logger_names: list[str]=['evolver']):
+    handler = logging.StreamHandler()
+    handler.setLevel(log_level)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+
+    root_dir = f"logs/{time.strftime('%Y-%m-%d_%H-%M-%S')}_{random.randint(10000, 99999)}"
+    print(f"log saved to {root_dir}")
+    file_handler = LoggingFileHandler(root_dir=root_dir)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    file_handler.setLevel("DEBUG")
+
+
+    for logger_name in logger_names:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel("DEBUG")
+        logger.addHandler(handler)
+        logger.addHandler(file_handler)
+
+
+@dataclass
+class Config(BaseConfig):
+    initial_executor_program: str = ""
+    insights: Optional[List[Dict[str, Any]]] = None
+    all_programs: Optional[List[Dict[str, Any]]] = None
+
+    feedback_data_path: str = field(default='http://cloud.staging.p1.cn/v2/ai-raw/fd4ff166-ad46-4d2c-ad7b-88c324e5fa32.parquet', metadata={'desc': "validate data path"})
+    metric_data_path: str = field(default='http://cloud.staging.p1.cn/v2/ai-raw/1b183809-62c4-4fca-bfe4-7a0d6ba8e690.parquet', metadata={'desc': "validate data path"})
+    test_data_path: str = field(default="", metadata={'desc': "validate data path"})
+
+    seed: int = field(default=-1, metadata={'desc': "random seed"})
+    sample_nums: int = field(default=400, metadata={'desc': "sample nums"})
+    feedback_sample_nums: int = field(default=400, metadata={'desc': "sample nums of feedback dataset"})
+    metric_sample_nums: int = field(default=400, metadata={'desc': "sample nums of metric dataset"})
+    metric_sample_nums_large: int = field(default=-1, metadata={'desc': "large sample nums of metric dataset which means more accuracy but slower"})
+    batch_size: int = field(default=50, metadata={'desc': "batch size"})
+    max_concurrency: int = field(default=400, metadata={'desc': "max concurrency"})
+    early_stop_check_interval: int = field(default=-1, metadata={'desc': "the interval to check early stop"})
+    early_stop_metrics_func: str = field(default="lambda x: x['f1_score'] < 0.1", metadata={'desc': "the function used to determine early stop from metrics"})
+
+    rules: str = field(default="rules", metadata={'desc': "rules"})
+    examples: str = field(default="examples", metadata={'desc': "examples"})
+    behavior: str = field(default="behavior", metadata={'desc': "behavior"})
+
+    model_name: str = field(default='fallback/gpt-4.1-mini', metadata={'desc': "model name"})
+    model_temperature: float = field(default=1.0, metadata={'desc': "model temperature"})
+    api_key: str = field(default="", metadata={'desc': "llm api_key"})
+    current_best: float = field(default=0.9, metadata={'desc': "current best model"})
+    use_large_dataset_under_round: int = field(default=50, metadata={'desc': "use large dataset under round"})
+    round_number: int = field(default=1, metadata={'desc': "round number"})
+
+    test: bool = field(default=False, metadata={'desc': "run on test dataset"})
+    debug: bool = field(default=False, metadata={'desc': "debug mode"})
+
+
+@retry(
+        wait=wait_fixed(1),
+        stop=stop_after_attempt(3),
+        reraise=True,
+        before_sleep=before_sleep_log(_logger, logging.WARNING),
+        retry=retry_if_not_exception_type((BadRequestError, CancelledError)),
+        )
+async def label_by_llm(client, system_msg, user_msg, conf: Config):
+    _logger.debug(f"model: {conf.model_name}, temperature: {conf.model_temperature}", )
+    _logger.debug("system message: \n%s", system_msg)
+    _logger.debug("user message: \n%s", user_msg)
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
+    model = conf.model_name
+    temperature = conf.model_temperature
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            # max_tokens=8192,
+            # top_p=1.0,
+        )
+    except BadRequestError as e:
+        _logger.error(f"llm error: {e}")
+        budget_error = 'Budget has been exceeded!'
+        if budget_error in e.response.text:
+            print('budget exceeded')
+        print(type(e))
+        print(type(e).__name__)
+        raise e
+    except Exception as e:
+        _logger.error(f"error: {e}")
+        raise e
+    
+    # _logger.debug(f"response: {response}")
+
+    res = response.choices[0].message.content
+    if res is None:
+        raise ValueError(f"response is None")
+    return res
+
+class ExtractDfError(Exception):
+    """Raised when cannot extract/parse JSON from llm output occurs."""
+    pass
+
+# =============================
+# Selection via LLM -> returns Dict
+# =============================
+@retry(
+    wait=wait_fixed(1),
+    stop=stop_after_attempt(3),
+    reraise=True,
+    retry=retry_if_not_exception_type((BadRequestError, CancelledError)),
+)
+async def select_by_llm(system_msg: str, user_msg: str, timeout_sec: float = 30.0) -> Dict[str, Any]:
+    """Call chat.completions with strict JSON response_format and parse output to Dict."""
+    client = AsyncOpenAI(
+        base_url='https://llm-api.p1.cn/v1',
+        api_key=os.environ.get("OPENAI_API_KEY", ""),
+    )
+    async with sem:
+        resp = await client.chat.completions.create(
+            model="gpt-4.1",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.4,
+            response_format={"type": "json_object"},
+        )
+    content = resp.choices[0].message.content if resp.choices else ""
+    if not content:
+        raise ValueError("LLM 返回为空")
+    try:
+        return json.loads(content)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", content)
+        if m:
+            return json.loads(m.group(0))
+        raise ExtractDfError("LLM 返回非 JSON 或解析失败")
+
+async def select_feedback_with_llm(feedback_dict: Dict[str, List[str]], feedback_types: List[str], metrics: Dict[str, float]) -> Dict[str, Any]:
+    current_program = re.sub(r'"""本次优化意图：.*?"""', '', RAW_PROGRAM, flags=re.DOTALL).strip()
+
+    intention_match = re.search(r'"""本次优化意图：(.*?)"""', RAW_PROGRAM, re.DOTALL)
+    if intention_match:
+        raw_intention = intention_match.group(1).strip()
+    else:
+        raw_intention = "调用一次大语言模型完成用户消息审核的最简单业务逻辑。"
+
+    json_content = """
+    {
+    "reflection": "<string>",
+    "False Positive": { "count": <int>, "items": [<string>, ...] },
+    "False Negative": { "count": <int>, "items": [<string>, ...] },
+    "True Negative": { "count": <int>, "items": [<string>, ...] },
+    "True Positive": { "count": <int>, "items": [<string>, ...] }
+    }"""
+    user_message = f"""
+    请阅读下方程序内容、程序设计意图，评估指标及候选样本，从每类样本中挑选最具代表性的若干条（具体数量由你决定），**必须完整地将样本写下来**，同时给出具体可操作可执行的分析以及优化建议，帮助开发人员改进程序。
+
+    当前版本的用户聊天行为审核程序如 <current_program> 所示。
+    <current_program>
+    ```python
+    {current_program}
+    ```
+    </current_program>
+
+    这一版本程序是提升用户聊天内容审核准确性的一次尝试，在规划过程中，该尝试的目标和方案如下：
+    <intention>
+    {raw_intention}
+    </intention>
+
+    评估指标(JSON)：
+    {json.dumps(metrics, ensure_ascii=False)}
+
+    候选样本(JSON，以键区分四类)：
+    {json.dumps(feedback_dict, ensure_ascii=False)}
+
+    输出的 JSON 格式必须严格为：
+    {json_content}
+
+    ***reflection部分必须尽可能详细且具体，给出可执行可操作的分析和建议***
+
+    **严格输出一个 JSON 对象**（不得有任何多余文字、Markdown 或代码围栏）。
+    """.strip()
+
+
+    response_obj = await select_by_llm(SYSTEM_TEMPLATE, user_message)
+    _logger.debug("LLM JSON response: %s", json.dumps(response_obj, ensure_ascii=False))
+    return response_obj
+
+
+def extract_df(text):
+    match = re.search(r"<output>\s*(\d+)\s*\n(.*?)\s*</output>", text, re.DOTALL)
+    if not match:
+        return None, None
+    predicted_value = int(match.group(1))
+    reason = match.group(2).strip()
+    return predicted_value, reason
+
+def extract_df_from_csv(text):
+    # extract csv string from text quoted by <output_csv> and </output_csv>
+    output_pattern = r"<output_csv>(.*?)</output_csv>"
+    match = re.search(output_pattern, text, re.DOTALL)
+    if match is None:
+        raise ValueError(f"<output_csv> and </output_csv> not found in {text}")
+    
+    dtype_dict = {
+        'id': 'string',
+        'predicted': 'int',
+        'reason': 'string',
+    }
+    return pd.read_csv(StringIO(match.group(1)), dtype=dtype_dict, usecols=[0, 1])
+
+def metrics_to_str(metrics: Dict[str, float]) -> str:
+    if not metrics:
+        return "（无指标）"
+    order = ["f1_score", "precision", "recall", "score", "labeled_ratio"]
+    lines = []
+    for k in order:
+        if k in metrics:
+            v = metrics[k]
+            lines.append(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+    # 追加其余非标准键
+    for k, v in metrics.items():
+        if k not in order:
+            lines.append(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+    return "\n".join(lines)
+
+async def format_df(df: pd.DataFrame, threshold: float=1.0):
+    out_FN = []
+    out_FP = []
+    out_TN = []
+    out_TP = []
+    format_str = '''# 示例样本{id}
+## 待审核消息: {message}
+
+## 消息所在对话: 
+{context}
+
+## 模型预测内容: 
+{analysis}
+
+## 模型预测结果: {predicted}
+
+## 正确答案: {ground_truth}
+
+'''
+
+    for _, row in df.iterrows():
+        predicted = row['predicted']
+        predicted = 1.0 if predicted >= threshold else 0.0
+        gt_text = "违规 (1)" if row['label'] == 1 else "正常 (0)"
+        pred_bin = 1.0 if row['predicted'] >= threshold else 0.0
+        pred_text = "违规 (1)" if pred_bin == 1.0 else "正常 (0)"
+        out = format_str.format(
+            id=row['id'],
+            message=row.get('message', ''),
+            context=row.get('context', ''),
+            ground_truth=gt_text,
+            analysis=row.get('analysis', ''),
+            predicted=pred_text,
+        )
+
+        if predicted == 1 and row['label'] == 0:
+            out_FP.append(out)
+        elif predicted == 0 and row['label'] == 1:
+            out_FN.append(out)
+        elif predicted == 1 and row['label'] == 1:
+            out_TP.append(out)
+        elif predicted == 0 and row['label'] == 0:
+            out_TN.append(out)
+    
+    FP = len(out_FP)
+    FN = len(out_FN)
+    TP = len(out_TP)
+    TN = len(out_TN)
+
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    recall    = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+    f1        = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    accuracy  = (TP + TN) / (TP + TN + FP + FN) if (TP + TN + FP + FN) > 0 else 0.0
+
+    metrics_dict = {
+        "TP": TP,
+        "FP": FP,
+        "TN": TN,
+        "FN": FN,
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+        "accuracy": round(accuracy, 4),
+        "support": TP + TN + FP + FN,
+    }
+    
+    feedback_dict = {
+        "不违规但被错误预测为违规的(False Positive)": out_FP,
+        "违规但被错误预测为不违规的(False Negative)": out_FN,
+        "违规且被正确预测为违规的(True Positive)": out_TP,
+        "不违规且被正确预测为不违规的(True Negative)": out_TN
+    }
+
+    selected_feedback_obj = await select_feedback_with_llm(
+        feedback_dict,
+        ["False Positive", "False Negative", "True Positive", "True Negative"],
+        metrics_dict
+    )
+    selected_feedback_obj = normalize_selected_feedback(selected_feedback_obj)
+    select_FP = selected_feedback_obj.get("False Positive", {})
+    select_FN = selected_feedback_obj.get("False Negative", {})
+    select_TP = selected_feedback_obj.get("True Positive", {})
+    select_TN = selected_feedback_obj.get("True Negative", {})
+
+
+    # Build human-friendly detail_text
+    def _block(title: str, total: int, items: List[str]) -> str:
+        lines = [f"{title}(共计 {total} 条):"]
+        lines.append("\n".join(items))
+        return "\n".join(lines)
+
+    detail_parts: List[str] = []
+    detail_parts.append("具体打标详情如下。\n")
+
+    detail_parts.append(_block("违规但被错误预测为不违规的(False Positive)", select_FP.get("count",0), select_FP.get('items', [])))
+    detail_parts.append(_block("不违规但被错误预测为违规的(False Negative)", select_FN.get("count",0), select_FN.get('items', [])))
+    detail_parts.append(_block("不违规且被正确预测为不违规的(True Negative)", select_TN.get("count",0), select_TN.get('items', [])))
+    detail_parts.append(_block("违规且被正确预测为违规的(True Positive)", select_TP.get("count",0), select_TP.get('items', [])))
+    detail_parts.append(f"\n### 反思具体内容以及优化建议：\n: {selected_feedback_obj.get('reflection', '')}")
+
+    return "\n".join(detail_parts)
+
+def extract_msg(program: str):
+    sys_msg_pattern = r"<system_message>(.*?)</system_message>"
+    user_msg_pattern = r"<user_message>(.*?)</user_message>"
+    sys_msg = re.search(sys_msg_pattern, program, re.DOTALL).group(1)
+    user_msg = re.search(user_msg_pattern, program, re.DOTALL).group(1)
+    if sys_msg is None or user_msg is None:
+        raise ValueError(f"system_message or user_message not found in {program}")
+    return sys_msg, user_msg
+
+
+def calculate_metrics(dataset, res_df: Optional[pd.DataFrame], sample_nums: int) -> Dict[str, float]:
+    if res_df is None:
+        return default_metrics
+    
+    precision, recall = dataset.precision_n_recall(
+        res_df,
+        predicted_label_name="predicted",
+    )
+    precision = round(float(precision), 4)
+    recall = round(float(recall), 4)
+
+    f1 = round(float(2*precision*recall/(precision+recall)), 4) if precision+recall > 0 else 0.0
+    metrics = {
+        'f1_score': f1,
+        'precision': round(precision, 4),
+        'recall': round(recall, 4),
+    }
+
+    labeled_ratio = res_df.shape[0] / sample_nums
+    _logger.info(f"total: {sample_nums}, labeled: {res_df.shape[0]}, labeled_ratio: {labeled_ratio}")
+    
+    for k, v in metrics.items():
+        metrics[k] = v * labeled_ratio
+
+    metrics['labeled_ratio'] = round(labeled_ratio, 4)
+    return metrics
+
+
+def should_early_stop(dataset, res_df, conf):
+    metrics = calculate_metrics(dataset, res_df, res_df.shape[0])
+    return metrics, eval(conf.early_stop_metrics_func)(metrics)
+
+def batch_evaluate_wrapper(process_fn, batch_size, max_concurrency=10, early_stop_check_interval=-1, early_stop_func=None):
+
+    async def process_helper(
+        sem: asyncio.Semaphore,
+        idx: int,
+        df_input: pd.DataFrame,
+        ctx):
+
+        eval_name = ctx.get('eval_name', 'eval')
+        log_prefix = f"{eval_name}/batch{idx}"
+
+        _logger.info(f"[{eval_name}][batch {idx}] process {len(df_input)} rows")
+        
+        # _logger.debug(f"%s", df_input.to_csv(index=False), extra={'to_file': f'{log_prefix}/input_original.csv'})
+        async with sem:
+            old_id_map = None
+            if 'id' in df_input.columns:
+                old_id_map = df_input[['id']].copy()
+                old_id_map['new_id'] = pd.RangeIndex(1, len(df_input) + 1).astype(str)
+
+            # old_ids = df_input['id'].copy() if 'id' in df_input.columns else None
+            df_input = df_input.copy()
+            df_input['id'] = pd.RangeIndex(1, len(df_input) + 1).astype(str)
+
+            marked_input = keep_columns(df_input, ['id', 'message', 'context'])
+            # _logger.debug(f"%s", marked_input.to_csv(index=False), extra={'to_file': f'{log_prefix}/input_marked.csv'})
+
+            try:
+                df_output =  await process_fn(marked_input)
+                assert df_output is not None, f"[{eval_name}][batch {idx}] process_fn returned None"
+            except Exception as e:
+                _logger.error(f"[{eval_name}][batch {idx}] process_fn failed: {e}")
+                # raise e
+                return idx, None
+            
+            # _logger.debug(f"%s", df_output.to_csv(index=False),extra={'to_file': f'{log_prefix}/output_original.csv'})
+        
+            df_output = df_output.drop_duplicates(subset=['id'], keep='first')
+            df_merged = pd.merge(df_input, df_output, on='id', how='inner')
+            df_merged = df_merged[df_merged['predicted'].isin([0, 1])]
+            if len(df_merged) != len(df_input):
+                _logger.warning(f"[{eval_name}][batch {idx}]len(df_merged) != len(df_input), {len(df_merged)} != {len(df_input)}")
+
+            # _logger.debug(f"%s", df_merged.to_csv(index=False), extra={'to_file': f'{log_prefix}/output_merged.csv'})
+
+            # if old_ids is not None:
+            #     df_merged['id'] = old_ids.values
+
+            if old_id_map is not None:
+                df_merged = df_merged.merge(
+                    old_id_map.rename(columns={'id': 'old_id'}),
+                    left_on='id',
+                    right_on='new_id',
+                    how='left'
+                )
+                df_merged['id'] = df_merged['old_id']
+                df_merged = df_merged.drop(columns=['old_id', 'new_id'])
+            return idx, df_merged
+
+    async def fn(input_df, name):
+        return await batch_evaluate(name, input_df, process_helper, batch_size, max_concurrency, early_stop_check_interval, early_stop_func)
+    return fn
+
+async def batch_evaluate(
+        name,
+        input_df,
+        process_fn,
+        batch_size,
+        max_concurrency,
+        early_stop_check_interval,
+        early_stop_func,
+        )-> Tuple[Optional[pd.DataFrame], str]:
+    sem = asyncio.Semaphore(max_concurrency)
+    batches: List[pd.DataFrame] = [input_df.iloc[i : i + batch_size] for i in range(0, len(input_df), batch_size)]
+
+    tasks = [
+        asyncio.create_task(process_fn(sem, i, b, {'eval_name': name}))
+        for i, b in enumerate(batches)
+    ]
+    all_results: List[pd.DataFrame] = [None] * len(batches)
+
+    finished = 0
+    stop_flag = False
+    stop_reason = ""
+
+    cancel_unfinished = lambda: [t.cancel() for t in tasks if not t.done()]    
+
+    for fut in asyncio.as_completed(tasks):
+        try:
+            idx, df_chunk = await fut
+            finished += 1
+            all_results[idx] = df_chunk
+        except Exception:
+            stop_flag = True
+            traces = traceback.format_exc(limit=50)
+            stop_reason = f"failed to evaluate:\n{traces}"
+            _logger.error(f"failed to evaluate: \n{traces}")
+
+        if not stop_flag and early_stop_check_interval > 0 and finished % early_stop_check_interval == 0:
+            res_df = pd.concat([item for item in all_results if item is not None], ignore_index=True)
+            stop_flag, stop_reason = early_stop_func(res_df)
+
+        if stop_flag:
+            break
+
+    if stop_flag:
+        cancel_unfinished()
+
+    if all(r is None for r in all_results):
+        return None, stop_reason
+    else:
+        return pd.concat(all_results, ignore_index=True), stop_reason
+
+
+async def eval_for_metrics(dataset, batch_evaluate_fn, sample_nums, name):
+    if not sample_nums or sample_nums == -1:
+        sample_nums = len(dataset._df)
+    input_df = dataset.sample(n=sample_nums)
+    output_df, _ = await batch_evaluate_fn(input_df, name)
+    if output_df is None:
+        _logger.error(f"[{name}] output_df is None")
+        return {'f1_score': 0.0, 'labeled_ratio': 0}
+    metrics = calculate_metrics(dataset, output_df, input_df.shape[0])
+    return metrics
+
+async def eval_for_feedback(dataset, batch_evaluate_fn, sample_nums, name):
+    input_df = dataset.sample(n=sample_nums)
+    output_df, stop_reason = await batch_evaluate_fn(input_df, name)
+
+    if output_df is None:
+        return stop_reason
+
+    # metrics = calculate_metrics(dataset, output_df, input_df.shape[0])
+    positive_count = output_df[output_df['label'] == 1].shape[0]
+    all_count = output_df.shape[0]
+    reflection_text = await format_df(output_df)
+    return reflection_text
+    
+def get_dataset(path: str):
+    return Dataset(
+        path=path,
+        type="parquet",
+        truth_column_name="label",
+    )
+
+def process_wrapper(program: str, conf: Config):
+    system_msg, user_msg = extract_msg(program)
+    system_tpl = string.Template(system_msg)
+    user_tpl = string.Template(user_msg)
+    sys_args = {
+        'behavior': conf.behavior,
+        'rules': conf.rules,
+        'examples': conf.examples,
+    }
+
+    client = AsyncOpenAI(
+        base_url='https://llm-api.p1.cn',
+        api_key=conf.api_key,
+    )
+    @retry(
+            wait=wait_fixed(1),
+            stop=stop_after_attempt(3),
+            reraise=True,
+            before_sleep=before_sleep_log(_logger, logging.WARNING),
+            retry=retry_if_exception_type((ExtractDfError)),
+            )
+    async def process_batch(
+        df_input: pd.DataFrame,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Runs one batch through the LLM and parses CSV response.
+        Returns (batch_idx, dataframe|None, error_message|None)
+        """
+        user_args = {
+            'behavior': conf.behavior,
+            'rules': conf.rules,
+            'examples': conf.examples,
+            'input_csv': df_input.to_csv(index=False),
+        }
+
+        res = await label_by_llm(
+            client,
+            system_tpl.safe_substitute(sys_args),
+            user_tpl.safe_substitute(user_args),
+            conf,
+        )
+        _logger.debug(f"llm generated: {res}")
+
+        try:
+            df_output = extract_df_from_csv(res)
+        except Exception as e:
+            _logger.error(f"extract_df failed: {e} \n\n {res}")
+            raise ExtractDfError(f"extract_df failed: {e})")
+        
+        return df_output
+            
+    return process_batch
+
+def trim_nonpython(text: str) -> str:
+    # Remove ```python ... ``` wrapper if present
+    fenced = re.match(r"^```(?:python)?\s*([\s\S]*?)\s*```$", text.strip())
+    if fenced:
+        return fenced.group(1).strip()
+    return text.strip()
+
+def load(program, conf: Config):
+    program = trim_nonpython(program)
+    mod_name = 'eval_helper'
+    # Create a new module object
+    mod = types.ModuleType(mod_name)
+    os.environ["MODEL_NAME"] = conf.model_name
+
+    # Execute the code in the module's namespace
+    exec(program, mod.__dict__)
+    patch_get_llm_client(mod, get_llm_client_wrapper(conf.api_key))
+
+    # Optionally, register it so `import` can find it
+    sys.modules[mod_name] = mod
+
+async def inner_evaluate(program: str, conf: Config) -> EvalResult:
+    conf = Config().merge(conf)
+    setup_stdout_logging("INFO", logger_names=[__name__])
+    _logger.info(f"evaluate program with config: {conf}")
+    ans = EvalResult()
+    ans.metrics = default_metrics
+
+    global RAW_PROGRAM
+    RAW_PROGRAM = program
+
+    os.environ["OPENAI_API_KEY"] = conf.api_key
+    # code based 
+    try:
+        load(program, conf)
+    except Exception as e:
+        _logger.error(f"load program failed: {e}")
+        ans.feedback = f"load program failed: {e}"
+        return ans
+    
+    try:
+        from eval_helper import review_user_message
+        process_fn = review_user_message
+    except Exception as e:
+        traces = traceback.format_exc(limit=50)
+        _logger.error(f"load program failed: \n{traces}")
+        ans.feedback = f"program failed to compile: \n{traces}"
+
+    # prompt based
+    # process_fn = process_wrapper(program, conf)
+
+    early_stop_func = eval(conf.early_stop_metrics_func)
+    batch_evaluate_fn = batch_evaluate_wrapper(
+        process_fn,
+        batch_size=conf.batch_size,
+        max_concurrency=conf.max_concurrency,
+        early_stop_check_interval=conf.early_stop_check_interval,
+        early_stop_func=early_stop_func,
+    )
+
+    if conf.test:
+        dataset = get_dataset(conf.test_data_path)
+        sample_nums = conf.sample_nums if conf.debug else None
+        ans.metrics = await eval_for_metrics(dataset, batch_evaluate_fn, sample_nums, 'test')
+    else:
+        metrics_dataset = get_dataset(conf.metric_data_path)
+        feedback_dataset = get_dataset(conf.feedback_data_path)
+
+        if conf.round_number < conf.use_large_dataset_under_round:
+            sample_nums = conf.metric_sample_nums_large
+        else:
+            sample_nums = conf.metric_sample_nums
+        
+        ans.metrics, ans.feedback = await asyncio.gather(
+            eval_for_metrics(metrics_dataset, batch_evaluate_fn, sample_nums, 'metrics'),
+            eval_for_feedback(feedback_dataset, batch_evaluate_fn, conf.feedback_sample_nums, 'feedback')
+        )
+    
+    if ans.metrics['f1_score'] > conf.current_best:
+        sample_nums = conf.metric_sample_nums_large
+        ans.metrics = await eval_for_metrics(metrics_dataset, batch_evaluate_fn, sample_nums, 'metrics2')
+
+    return ans
+
+class Insight:
+    def __init__(self, insight: Dict[str, str]) -> None:
+        self.program = extract_xml(insight["feedback"], "executor_program")
+        self.feedback = extract_xml(insight["feedback"], "executor_feedback")
+        self.metrics = insight["metrics"]
+
+
+@dataclass
+class Evovler:
+    selected_insights: Optional[List[Dict[str, Any]]] = None
+
+    async def __call__(self, system_prompt: str, insight: Insight) -> str:
+        selected_block = ""
+        if self.selected_insights:
+            parts = []
+            for i, ins in enumerate(self.selected_insights[:8], 1):
+                try:
+                    prog_i = extract_xml(ins["feedback"], "executor_program")
+                except Exception:
+                    prog_i = ""
+                try:
+                    fb_i = extract_xml(ins["feedback"], "executor_feedback")
+                except Exception:
+                    fb_i = ""
+                metrics_i = ins.get("metrics") or {}
+                parts.append(
+                    f"### 例 {i}\n"
+                    f"<executor_program>\n{prog_i}\n</executor_program>\n"
+                    f"<executor_feedback>\n{fb_i}\n</executor_feedback>\n"
+                    f"metrics: {json.dumps(metrics_i, ensure_ascii=False)}"
+                )
+            selected_block = "\n\n".join(parts)
+
+        user_prompt = f"""
+
+{"\n我们提供了一些过往的优化程序案例可以提供参考，你可以检查过往优化程序中是否存在问题，可以根据这些经验优化当前需要优化的程序：\n<selected_examples>\n" + selected_block + "\n</selected_examples>" if selected_block else ""}
+
+***当前需要优化的程序如下:***
+<program_candidate>
+{insight.program}
+</program_candidate>
+待优化程序的评测结果如下:
+{insight.metrics}
+待优化程序的评测反馈如下:
+{insight.feedback}
+
+
+- 过去的经验:
+1. Program中对各类TEMPLATE的优化较少，如果对其进行优化，可能获得进一步的提升。
+2. Program中可以通过get_similar_cases等函数从数据库中调用与当前任务相关的样本进行参考。
+3. Program如果使用更多工具可能会更好地完成当前任务，你所使用的工具可以自己编写或者从Python库中获取，确保代码可以执行。
+4. 如果你认为Program需要通过额外的分析思考以获得更优的结果，就应当在它的System prompt里面明确要求大模型通过文字输出额外的分析，同时把指令明确地写在System prompt里。例如，如果想让Executor's Program额外针对样本的上下文进行分析，就在System prompt中加入“强制要求：在模型输出的<analysis>中**必须**先对对话记录的每条信息逐条进行标注，包括
+1. typo 修复。
+2. 补全主谓宾使其成为完整的句子。
+3. 标明说这句话的实际意图。”
+
+To achieve the task, please propose modifications to the program_candidate. Describe each change with a SEARCH/REPLACE block described as following:
+<<<<<<< SEARCH
+[Original code block to be found and replaced]
+=======
+[New code block to replace the original]
+>>>>>>> REPLACE
+注意, 禁止一次 block 修改太多行, 这样会导致更改无法生效.
+>>>>>>> REPLACE
+"""
+        client = AsyncOpenAI(base_url="https://llm-api.p1.cn/v1")
+        model = random.choice(["openrouter/anthropic/claude-sonnet-4", "openrouter/x-ai/grok-4", "openai/gpt-4o", "openrouter/google/gemini-2.5-pro"])
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=1.0,
+            )
+            content = response.choices[0].message.content
+            assert content, "Response from OpenAI is empty"
+            pattern = r"[<]{5,9} SEARCH(.*?)[=]{5,9}(.*?)[>]{5,9} REPLACE"
+            program = insight.program
+            for match in re.findall(pattern, content, re.DOTALL):
+                original, replacement = match
+                original = original.strip()
+                replacement = replacement.strip()
+                program = program.replace(original, replacement)
+            assert program != insight.program, "No changes made to the program"
+            return program
+        except Exception as e:
+            return repr(e)
+
+def _has_program(row: Dict, insight: Dict) -> bool:
+    prog = row.get("program")
+    parent_prog = insight.get("program") if insight else None
+    if prog is None or (isinstance(prog, str) and not prog.strip()):
+        return False
+    if parent_prog is None or (isinstance(parent_prog, str) and not parent_prog.strip()):
+        return False
+    if prog.strip() == parent_prog.strip():
+        return False
+    if isinstance(prog, str) and prog.strip():
+        return True
+    return False
+
+def extract_xml(text: str, tag: str) -> str:
+    pattern = re.compile(rf"<{tag}>(.*?)</{tag}>", re.DOTALL)
+    match = pattern.search(text)
+    assert match, f"<{tag}> not found in the {text}."
+    return match.group(1).strip()
+
+async def evaluate(evolver_program: str, config_dict: Dict[str, Any]) -> EvalResult:
+    config = Config().merge(config_dict)
+    os.environ["OPENAI_API_KEY"] = config.api_key
+    program = config.initial_executor_program
+    llm_client = AsyncOpenAI(api_key=config.api_key, base_url="https://llm-api.p1.cn/v1")
+    parent_insight = Insight(config.insights[0]) if config.insights and len(config.insights) > 0 else None
+    config.all_programs = [r for r in (config.all_programs or []) if isinstance(r, Dict) and _has_program(r, config.insights[0])]
+    
+    if parent_insight is not None:
+        parent_program_code=f"""
+        需要优化的程序如下:
+        <program_candidate>
+        {parent_insight.program}
+        </program_candidate>
+        评测结果如下:
+        {parent_insight.metrics}
+        评测反馈如下:
+        {parent_insight.feedback}
+        """
+    else:
+        parent_program_code = "需要优化的程序如下:\n<program_candidate>\n无\n</program_candidate>\n评测结果如下:\n无\n评测反馈如下:\n无"
+    selected_insights: List[Dict[str, Any]] = []
+    if config.all_programs and len(config.all_programs) > 1:
+        try:
+            selector = LLMInsightSelector(
+                parent_program_code=parent_program_code,
+                all_programs=config.all_programs or [],
+                llm_client=llm_client,
+                temperature=0.2,
+                max_rounds=10,
+                max_select=5,
+                page_size=50,
+            )
+            selected_insights = await selector.run()
+        except Exception as e:
+            _logger.error(f"LLMInsightSelector failed: {e}")
+            if config.insights:
+                selected_insights = config.insights
+    else:
+        if config.insights:
+            selected_insights = config.insights[1:] # skip the first one as it's parent
+    if selected_insights:
+        try:
+            program = await Evovler(selected_insights=selected_insights)(
+                evolver_program,
+                Insight(selected_insights[0])
+            )
+        except Exception as e:
+            _logger.error(f"Evovler failed: {e}")
+    elif config.insights:
+        try:
+            program = await Evovler(selected_insights=config.insights)(
+                evolver_program,
+                Insight(config.insights[0])
+            )
+        except Exception as e:
+            _logger.error(f"Evovler (fallback) failed: {e}")
+    eval_result = EvalResult()
+    inner_eval_result = await inner_evaluate(program, config_dict)
+    eval_result.metrics = inner_eval_result.metrics
+    eval_result.feedback = f"""
+<executor_program>
+{program}
+</executor_program>
+<executor_feedback>
+{inner_eval_result.feedback}
+</executor_feedback>
+"""
+    return eval_result
