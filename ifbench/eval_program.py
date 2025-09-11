@@ -92,8 +92,8 @@ def build_feedback_prompt_no_llm(
 
         block = (
             f"Instruction {i}: {majority[system_idx]['prompt']}\n"
-            f"answer: {majority[system_idx]['answer']}\n"
-            f"final_answer: {majority[system_idx]['final_answer']}\n"
+            f"answer produced by <system_prompt_1>: {majority[system_idx]['answer']}\n"
+            f"final_answer produced by <system_prompt_2>: {majority[system_idx]['final_answer']}\n"
             f"results:\n{pairs_str}\n"
         )
         questions_str.append(block)

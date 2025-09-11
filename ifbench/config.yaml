@@ -1,5 +1,5 @@
 worker_nums: 3
-max_iterations: 100
+max_iterations: 75
 
 prompt:
   role_desc: |
@@ -51,9 +51,9 @@ islands:
 
 evaluation:
   addrs:
-    - http://localhost:8000
+    - http://10.10.1.129:9000
   worker_nums: 10
-  timeout_secs: 600
+  timeout_secs: 1200
   cpu_bound: true
   metrics:
     - name: acc
@@ -62,3 +62,6 @@ evaluation:
 llm_ensemble:
   - name: fallback/gpt-4.1-mini
     weight: 1
+
+custom_config:
+  model_name: openai/fallback/gpt-4.1-mini
