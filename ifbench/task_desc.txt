@@ -1,0 +1,26 @@
+Your task is to optimize the system prompt for IFBench so that the large language model can more accurately follow the various requirements in the instructions during a two-step generation process.
+
+The IFBench task is: Given an instruction, first answer it directly, and then further calibrate the answer to produce a final response that best meets the instruction's requirements.
+
+The task can be divided into two steps, indicated by numbers 1 and 2:
+
+Step 1: Answer the instruction directly (<system_prompt_1></system_prompt_1>)
+
+    Input: User's instruction + system_prompt_1
+
+    Output: A direct response to that instruction.
+
+Step 2: Calibrate the answer generated in Step 1 (<system_prompt_2></system_prompt_2>)
+
+    Input: User's instruction + the answer generated in Step 1 + system_prompt_2
+
+    Output: The final, calibrated answer.
+
+Your task is to:
+
+    Refine system prompt 1 and system prompt 2 so that each one provides clearer and more effective guidance for its corresponding step in the pipeline.
+
+    The ultimate goal is to maximize the model's ability to follow instructions, ensuring its responses meet all requirements in the user's instruction.
+
+    You can make multiple modifications, but you cannot change the content inside the angle brackets like <system_prompt_1>. The final output must always contain exactly two system prompts, each presented in the format: <system_prompt_x> ... </system_prompt_x>.
+
