@@ -1,0 +1,66 @@
+worker_nums: 3
+max_iterations: 75
+prompt:
+  role_desc: |
+    You are a prompt expert.
+  user_message_template: |
+    def obtain_user_message(task_desc, parent_program, insights):
+        metric_str = "\n".join([f"{k}: {parent_program['metrics'][k]}" for k in parent_program['metrics']])
+        feedback_str = parent_program["feedback"].split("==^&*(split-part)==")[0]
+        return f'''
+    You should write prompts to accomplish the following task:
+    <task_description>
+    {task_desc}
+    </task_description>
+
+    Here is a previous version:
+    <program_candidate>
+    <program>
+    {parent_program['program']}
+    </program>
+    <eval_result>
+    metrics:
+    {metric_str}
+    feedback:
+    {feedback_str}
+    </eval_result>
+    </program_candidate>
+
+    To achieve the task, please propose modifications to the program_candidate. Describe each change with a SEARCH/REPLACE block described as following:
+    <<<<<<< SEARCH
+    [Original code lines]
+    =======
+    [Modified code lines]
+    >>>>>>> REPLACE
+    '''
+  diff_mode: true
+
+sample:
+  num: 1
+  method: island
+islands:
+  num_islands: 3           # 总共有 5 个岛屿
+  reset_interval: 400  # 每 30 步重置一次岛屿
+  migration_interval: 400    # 每 10 步做一次迁移
+  migration_ratio: 0.0     # 迁移比例（0% 个体）
+  population_limit: 10    # 每个岛屿最多保存 10 个个体
+  include_metrics: 
+    - f1   # 岛屿使用的主要评价指标
+  limit_all_population: false
+
+evaluation:
+  addrs:
+    - http://10.10.1.129:9000
+  metrics:
+    - name: f1
+      expected: 1.0
+      higher_is_better: true
+  cpu_bound: true
+  worker_nums: 10
+  timeout_secs: 600
+llm_ensemble:
+  - name: fallback/gpt-4.1-mini
+    weight: 1
+
+custom_config:
+  model_name: fallback/gpt-4.1-mini
