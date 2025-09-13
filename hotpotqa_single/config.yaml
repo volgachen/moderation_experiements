@@ -44,9 +44,11 @@ islands:
   migration_interval: 400    # 每 10 步做一次迁移
   migration_ratio: 0.0     # 迁移比例（0% 个体）
   population_limit: 10    # 每个岛屿最多保存 10 个个体
+  remove_policy: definite
   include_metrics: 
     - f1   # 岛屿使用的主要评价指标
   limit_all_population: false
+  init_from_job_id: 2199
 
 evaluation:
   addrs:
@@ -57,10 +59,10 @@ evaluation:
       higher_is_better: true
   cpu_bound: true
   worker_nums: 10
-  timeout_secs: 600
+  timeout_secs: 1800
 llm_ensemble:
-  - name: fallback/gpt-4.1-mini
+  - name: gpt-4.1-mini
     weight: 1
 
 custom_config:
-  model_name: fallback/gpt-4.1-mini
+  model_name: openai/gpt-4.1-mini

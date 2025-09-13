@@ -8,7 +8,9 @@ import time
 from dataclasses import dataclass, field
 from rouge_score import rouge_scorer
 
+
 from alpha_evolve_evaluator.evaluator import EvalResult, BaseConfig
+from protocols import logger
 
 
 def load_json_from_url(url):
@@ -21,7 +23,7 @@ def load_json_from_url(url):
         return data
         
     except requests.exceptions.RequestException as e:
-        print(f"请求错误: {e}")
+        logger.info(f"请求错误: {e}")
         return None
 
 
@@ -143,16 +145,24 @@ def build_feedback_prompt(
     )
     return header + "\n".join(questions_str) + tail
 
-def safe_retrieve(retrieve_fn, query, retries=100, delay=0.2):
+sem_wiki = asyncio.Semaphore(1)
+
+async def safe_retrieve(retrieve_fn, query, retries=200, delay=1):
+  async with sem_wiki:
     for attempt in range(retries):
+        if query == None:
+            logger.info(f"[Retrieve error], query is {query}")
+            return []  # 最终失败返回空
         try:
             return retrieve_fn(query).passages
         except Exception as e:
             if attempt < retries - 1:
-                time.sleep(delay) # 随机等待，避免雪崩
+                await asyncio.sleep(delay) # 随机等待，避免雪崩
             else:
-                print(f"[Retrieve error] {e}, query {query}, attempt {attempt+1}/{retries}")
+                logger.info(f"[Retrieve error] {e}, query {query}, attempt {attempt+1}/{retries}")
                 return []  # 最终失败返回空
+
+sem_global = asyncio.Semaphore(80)
 
 class HotpotQA_HoverMultiHop(dspy.Module):
     def __init__(self,top_k):
@@ -164,25 +174,40 @@ class HotpotQA_HoverMultiHop(dspy.Module):
         self.summarize1 = dspy.ChainOfThought("question,passages->summary")
         self.summarize2 = dspy.ChainOfThought("question,context,passages->summary")
 
-    def forward(self, question):
+    async def aforward(self, question):
+      async with sem_global:
         # HOP 1
-        hop1_docs = safe_retrieve(self.retrieve_k, question)
+        hop1_docs = await safe_retrieve(self.retrieve_k, question)
         hop1_docs = ' '.join([str(i+1)+". " + hop1_docs[i] for i in range(len(hop1_docs))])
-        summary_1 = self.summarize1(
-            question=question, passages=hop1_docs
-        ).summary  # Summarize top k docs
+        try:
+            summary_1 = await self.summarize1(
+                question=question, passages=hop1_docs
+            ).summary  # Summarize top k docs
+        except:
+            summary_1 = "Warning: Repetition phenomenon occurred, output is incomplete."
 
         # HOP 2
-        hop2_query = self.create_query_hop2(question=question, summary_1=summary_1).query
-        hop2_docs = safe_retrieve(self.retrieve_k, hop2_query)
-        hop2_docs = ' '.join([str(i+1)+". " + hop2_docs[i] for i in range(len(hop2_docs))])
-        summary_2 = self.summarize2(
-            question=question, context=summary_1, passages=hop2_docs
-        ).summary
+        try:
+            hop2_query = await self.create_query_hop2(question=question, summary_1=summary_1).query
+        except:
+            hop2_query = "Warning: Repetition phenomenon occurred, output is incomplete."
 
-        answer = self.final_answer(
-            question=question, summary_1=summary_1, summary_2=summary_2
-        ).answer
+        hop2_docs = await safe_retrieve(self.retrieve_k, hop2_query)
+        hop2_docs = ' '.join([str(i+1)+". " + hop2_docs[i] for i in range(len(hop2_docs))])
+        try:
+            summary_2 = await self.summarize2(
+                question=question, context=summary_1, passages=hop2_docs
+            ).summary
+        except:
+            summary_2 = "Warning: Repetition phenomenon occurred, output is incomplete."
+
+        try:
+            answer = await self.final_answer(
+                question=question, summary_1=summary_1, summary_2=summary_2
+            ).answer
+        except:
+            answer = "Warning: Repetition phenomenon occurred, output is incomplete."
+
 
         return {"hop1_docs":hop1_docs,"summary_1":summary_1,"hop2_query":hop2_query,"hop2_docs":hop2_docs,"summary_2":summary_2,"answer":answer}
 
@@ -192,7 +217,7 @@ async def get_hotpotqa_response_per_sys_priompt(user_prompt, answer, sys_prompt,
     prompts = re.findall(r"<system_prompt_\d+>.*?</system_prompt_\d+>", sys_prompt, flags=re.DOTALL)
 
     if len(prompts) != 4:
-        raise ValueError(f"Expected 4 system prompts, but found {prompts}")
+        raise ValueError(f"Expected 4 system prompts, but found {prompts}, {sys_prompt}")
 
     sys_prompt_1, sys_prompt_2, sys_prompt_3, sys_prompt_4 = prompts
     
@@ -204,7 +229,7 @@ async def get_hotpotqa_response_per_sys_priompt(user_prompt, answer, sys_prompt,
     system.final_answer.predict.signature.instructions = sys_prompt_4
 
     # 如果 system 是同步的，用 asyncio.to_thread
-    res = await asyncio.to_thread(system, user_prompt)
+    res = await system.aforward(user_prompt)
     if res["answer"] == None:
         res["answer"] = "Warning: Repetition phenomenon occurred, output is incomplete."
 
@@ -236,6 +261,7 @@ async def get_response_major_voting(i, sampled_user_prompts, sampled_answers, sy
     # {" ".join(f"{i+1}. {d['answer']}" for i, d in enumerate(res_s))}
     # """
     #     # lm 同步，用 asyncio.to_thread
+
     #     group_answer = await asyncio.to_thread(lm, integrated_prompt)
     #     group_answer = group_answer[0]
     #     if group_answer == None:
@@ -243,22 +269,55 @@ async def get_response_major_voting(i, sampled_user_prompts, sampled_answers, sy
     #     if "**Final Answer:**" in group_answer:
     #         group_answer = group_answer.split("**Final Answer:**")[1].strip()
     #     group_answers[i] = group_answer
-        answers = [d["answer"] for d in res_s]
-        n = len(answers)
+        integrated_prompt = f"""
+    You have a question and several LLM answers.
+    Your task is to select the answer that appears most frequently (the majority answer).
+    Only output the **index number** (just the number in LLM Answers, no extra words).
 
-        avg_f1s = []
-        for j, ans_j in enumerate(answers):
-            scores = []
-            for k, ans_k in enumerate(answers):
-                if j == k:
-                    continue
-                scores.append(string_pair_metrics(ans_j, ans_k)['f1'])
-            avg_f1s.append(sum(scores) / len(scores) if scores else 0.0)
+    Question:
+    {user_prompt}
 
-        # 选择平均 F1 最高的答案
-        best_idx = max(range(n), key=lambda m: (avg_f1s[m], -len(answers[m])))
-        group_answer = answers[best_idx]
+    LLM Answers:
+    {" ".join(f"{i}. {d['answer']}" for i, d in enumerate(res_s))}
+    """
+        # lm 同步，用 asyncio.to_thread
+        group_index = await asyncio.to_thread(lm, integrated_prompt)
+        if group_index[0] == None:
+            group_index = "Warning: Repetition phenomenon occurred, output is incomplete."
+
+        group_index = group_index[0].strip()   # 去掉前后空格换行
+
+        # 提取第一个纯数字
+        match = re.search(r"\d+", group_index)
+        if match and int(match.group()) in range(len(res_s)):
+            group_index = int(match.group())
+        else:
+            # fallback: 选择最短的答案
+            lengths = [len(d['answer']) for d in res_s]
+            group_index = min(range(len(res_s)), key=lambda i: lengths[i])
+
+        group_answer = res_s[group_index]['answer']
         group_answers[i] = group_answer
+        # print("single:", " ".join(f"{i+1}. {d['answer']}" for i, d in enumerate(res_s)))
+        # print("group:", group_answer)
+        # print("answer:", answer)
+        # print("score:", string_pair_metrics(group_answer, answer))
+        # answers = [d["answer"] for d in res_s]
+        # n = len(answers)
+
+        # avg_f1s = []
+        # for j, ans_j in enumerate(answers):
+        #     scores = []
+        #     for k, ans_k in enumerate(answers):
+        #         if j == k:
+        #             continue
+        #         scores.append(string_pair_metrics(ans_j, ans_k)['f1'])
+        #     avg_f1s.append(sum(scores) / len(scores) if scores else 0.0)
+
+        # # 选择平均 F1 最高的答案
+        # best_idx = max(range(n), key=lambda m: (avg_f1s[m], -len(answers[m])))
+        # group_answer = answers[best_idx]
+        # group_answers[i] = group_answer
 
 
 async def process_feedback(i, sampled_user_prompts, sampled_answers, system_prompts, majority_answers, group_answers, lm, feedbacks):
@@ -300,6 +359,7 @@ async def release_one_group_for_questions(
     dspy.settings.configure(
         lm=lm,
         rm=dspy.ColBERTv2(url=wiki_url),
+        async_mode=True,
     )
 
     # 读取数据
@@ -385,9 +445,10 @@ async def evaluate(program, config) -> EvalResult:
 
     if isinstance(program, str):
         program = [program]
+    # assert program[0].startswith("efff"), f"{type(program)} {program}"
 
     #feedback
-    print("start get feedback")
+    logger.info("start get feedback")
     feedbacks, _ = await release_one_group_for_questions(
         model_name = model_name,
         wiki_url=wiki_url,
@@ -402,7 +463,7 @@ async def evaluate(program, config) -> EvalResult:
     )
 
     #feedback
-    print("start get metric")
+    logger.info("start get metric")
     metric, all_final_answers = await release_one_group_for_questions(
         model_name = model_name,
         wiki_url=wiki_url,
@@ -421,26 +482,3 @@ async def evaluate(program, config) -> EvalResult:
     eval_results.feedback = feedbacks[0] + "==^&*(split-part)==" + "==^&*(split-val)==".join(all_final_answers)
 
     return eval_results
-
-
-if __name__ == "__main__":
-    program = '''<system_prompt_1>
-You are the first-hop **summarization module** in a multi-hop QA system. Your task is to generate a **comprehensive, structured summary** that:  1. **Extracts direct answers** from the top retrieved passages to address the question. 2. **Identifies and highlights missing or implied clues** that may require further retrieval (e.g., entities, connections, or contextual details).3. **Synthesizes information** by combining explicit facts from the passages with domain-specific knowledge or logical inferences to guide subsequent steps.  ### **Summary Structure** - **Entity/Person Mention**: Clearly state the subject (e.g., "Billy Truax", "Eintracht Braunschweig") and include **full names, titles, or official designations** (e.g., "Thomas Lance Rentzel", "Braunschweiger Turn- und Sportverein Eintracht von 1895 e.V."). - **Direct Answer**: Include **explicit answers** from the passages (e.g., birth dates, team affiliations, or direct statements). - **Clues for Next Steps**: Signal **missing information** (e.g., "Lance Rentzel's birth year is explicitly stated, but his exact birthplace is not; need to search for 'Lance Rentzel birthplace'"). - **Domain-Specific Context**: Add **relevant background** (e.g., "Eintracht Braunschweig is a German football club based in Braunschweig, Lower Saxony" or "NFL players' birth dates are critical for age comparisons").  ### **Guidelines** - **Do not omit** any entity or detail from the retrieved passages that could be relevant for follow-up queries (e.g., team names, locations, or historical context). - **Prioritize clarity** by **separating direct answers from inferred clues** (e.g., using bullet points, subheadings, or bolded labels). - **Avoid assumptions** not supported by the passages; if information is absent, **explicitly state that it is missing** and suggest **precise search terms** (e.g., "Verify Wichita Dwight D. Eisenhower National Airport's tower status via FAA records"). - **Include quantifiable data** (e.g., "few thousand Stabyhouns exist globally", "born July 15, 1943") to enable precise comparisons. - **Highlight connections** between entities (e.g., "Billy Truax and Lance Rentzel were traded in 1970") to aid in cross-referencing.  ### **Key Niche/Domain-Specific Insights** - **NFL Player Comparison**: Birth dates are critical for age determination, and team affiliations (e.g., "traded in 1970") may imply historical context. - **Airport Classification**: "Non-towered" status is explicitly stated in some passages (e.g., "non-towered public airport"), while others require inference (e.g., "major commercial airports typically have towers"). - **Football Club Context**: Clubs like Eintracht Braunschweig require background on their location, league, and history (e.g., "based in Braunschweig, Lower Saxony"). - **Quantifiable Data**: Use exact dates, numbers, or rankings (e.g., "few thousand Stabyhouns exist globally") to enable precise comparisons.  ### **Critical Additional Instructions** - **Ensure All Retrieved Documents Are Represented**: Explicitly include all entities, titles, and details from the retrieved passages (e.g., full names, film titles, and specific roles). - **Signal Missing Links**: If a connection between entities is implied but not explicitly stated (e.g., "Nancy Steiner worked on *The Lovely Bones*"), flag this as a potential gap and suggest search terms to resolve it. - **Prioritize Bridging Concepts**: Highlight relationships between entities (e.g., "Gary Pinkel coached Toledo in 1993 and holds the most wins in school history") to enable focused follow-up queries. - **Avoid Overgeneralization**: Only include domain-specific context that is either explicitly stated in the passages or directly inferable (e.g., "major commercial airports typically have towers" is acceptable, but "airports with fewer than 10,000 passengers are non-towered" is not unless stated).  ### **Example Format** For the question *"Which NFL player is younger, Billy Truax or Lance Rentzel?"*: - **Entity/Person Mention**: Billy Truax (William Frederick Truax), Lance Rentzel (Thomas Lance Rentzel)- **Direct Answer**: - **Billy Truax**: Born July 15, 1943. - **Lance Rentzel**: Born October 14, 1943. - **Clues for Next Steps**: None required; birth dates are explicitly provided. - **Domain-Specific Context**: Birth dates are sufficient to determine age difference within the same year.  For the question *"Which is a non-towered airport, Wichita Dwight D. Eisenhower National Airport or Montrose Regional Airport?"*: - **Entity/Person Mention**: Wichita Dwight D. Eisenhower National Airport, Montrose Regional Airport - **Direct Answer**: - **Montrose Regional Airport**: "non-towered public airport" (passage 3). - **Wichita Dwight D. Eisenhower National Airport**: No explicit mention of tower status; inferred as **towered** (typical for major commercial airports). - **Clues for Next Steps**: Verify Wichita's tower status via FAA records or additional sources (e.g., "Wichita Dwight D. Eisenhower National Airport tower status"). - **Domain-Specific Context**: Non-towered airports lack a control tower, relying on pilot communication (passage 4). Major commercial airports like Wichita usually have towers.  **Tip:** When summarizing, dont just compress; synthesizeinclude both direct answers and clues required for the systems next steps. Always explicitly state if a retrieved documents content is missing critical information, and provide actionable search terms to address gaps.
-</system_prompt_1>
-
-<system_prompt_2>
-Given the fields 'question' and 'summary_1', produce the field 'query' that optimizes the retrieval of additional documents for a multi-hop system.  **Task Details:** 1. **Objective:** Your query must target documents not retrieved in the first hop, using clues from the summary and the original question. 2. **Key Strategy:** - Identify gaps in the first hop's retrieved documents (e.g., missing entities, relationships, or specific details). - Use explicit information from the summary (e.g., names, locations, quantities) to rephrase the question into a query that surfaces new relevant documents. - Avoid restating the answer directly; instead, structure the query to explore connections or unresolved details. 3. **Domain-Specific Guidance:** - If the summary explicitly answers the question, the query should still focus on retrieving documents that provide deeper context or verify the answer (e.g., "What is the headquarters location of [Company]?" instead of "The answer is [Location]"). - Leverage entities mentioned in the summary (e.g., "Carhartt," "Aubrey O'Day") to anchor the query. - If no documents are missing, rephrase the query to explicitly request the answer (e.g., "Which has more acts, Elektra or From the House of the Dead?"). 4. **Avoid:** - Generating queries that duplicate the original question. - Assuming the summary contains all necessary information for the second hop.
-</system_prompt_2>
-
-<system_prompt_3>
-Given the fields 'question', 'context', and 'passages', produce the field 'summary'.  Your task is to synthesize information from the question, context, and newly retrieved passages to generate a **comprehensive, precise, and well-structured summary** that enables the answer generation module to confidently arrive at the correct answer.  ### Key Requirements: 1. **Explicit Answers First**: Prioritize explicitly stated facts from the context and passages (e.g., direct mentions of entities, roles, or relationships). 2. **Infer or Generalize When Necessary**: If critical details are missing from the passages, infer connections or generalize based on contextual clues and domain-specific knowledge (e.g., linking ownership structures, roles, or historical context). 3. **Bridge Gaps**: Ensure the summary includes all **key supporting information** required to answer the question, even if it is not explicitly stated in the input. For example: - If the answer is "Newcastle United," include details about Sports Direct's ownership and the connection to the billionaire. - If the answer is a person's role (e.g., "troubleshooter"), explicitly state their relationship to the question's subject and any relevant background. 4. **Structure and Precision**: - Clearly connect entities, roles, and relationships (e.g., "Stan Kroenke owns Sports Direct and Arsenal F.C."). - Avoid ambiguity by including all necessary contextual links (e.g., "Mike Ashley founded Sports Direct and owns Newcastle United"). - Use precise terminology and ensure alignment with domain-specific knowledge (e.g., "investigative journalist" instead of "writer"). 5. **Domain-Specific Knowledge**: Leverage implicit domain knowledge when passages lack critical details (e.g., knowing that "Project RAND" is linked to Henry H. Arnold and the RAND Corporation).  ### Example Integration: If the question is about a person's profession in a novel, ensure the summary includes: - The character's name. - Their profession (explicitly stated in the text). - Contextual links to the book series or plot (e.g., "in *The Girl in the Spider's Web*"). - Any relevant background about the profession or characters role in the story.  Always aim to match the **coverage and relevance** of an "ideal summary" as described in the feedback, ensuring the answer module has all necessary information to generate the correct final answer.
-</system_prompt_3>
-
-<system_prompt_4>
-Given the fields 'question', 'summary_1', and 'summary_2', produce the field 'answer' by: 1. **Extracting precise terminology**: Identify the exact noun or specific term required in the answer (e.g., "Medicare" rather than "Medicare cuts"). Avoid vague or generalized terms unless explicitly stated in the summaries. 2. **Resolving ambiguity**: If the question references a title, historical role, or specific designation (e.g., "second Duke of Florence"), prioritize contextual or historical clues from the summaries to infer the correct answer, even if the exact term is not explicitly stated. Use domain-specific knowledge (e.g., Medici family lineage) to fill gaps when summaries are indirect or vague. 3. **Cross-referencing summaries**: Ensure consistency between summaries. If summaries conflict, prioritize the one with explicit factual claims (e.g., numerical data, direct statements). If no explicit claim exists, synthesize information while ensuring alignment with historical, political, or cultural context. 4. **Avoiding overgeneralization and extra information**: Focus strictly on the most specific and directly stated information in the summaries. Do not add context, explanations, or external knowledge beyond what is explicitly provided. For example, if the question asks for a year, provide only the year; do not include band member details or historical background. 5. **Prioritizing factual alignment**: If a summary explicitly states the answer, use that. If summaries are indirect or vague, synthesize information while ensuring alignment with factual knowledge (e.g., linking "Path to Prosperity" to Rep. Paul Ryans Medicare proposal).  **Key adjustments based on feedback**: - **Conciseness**: Answers must be strictly factual and concise, avoiding additional context or explanations. For example, if the question is "Is X shorter than Y?" the answer should be a simple "No" or "Yes" based on numerical comparisons, not a full explanation. - **Numerical precision**: When comparing measurements (e.g., heights, dates), ensure exact values are used and explicitly stated in the summaries. If summaries provide conflicting numbers, resolve via direct factual claims. - **Domain-specific knowledge**: Use known facts (e.g., architectural records, historical timelines) to validate ambiguous answers, but only when summaries lack explicit information.
-</system_prompt_4>'''
-    res = asyncio.run(evaluate(program, {
-        "valid_json_path": "http://cloud.staging.p1.cn/v2/ai-raw/6cbd4a88-404b-4fa3-9ba5-65c887a6b336.json",
-        "api_key": "sk-eSSyW8WmvklUVxZOikxEEQ",
-    }))
-    import pdb; pdb.set_trace()
