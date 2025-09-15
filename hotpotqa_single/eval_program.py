@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from rouge_score import rouge_scorer
 
+from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_not_exception_type, retry_if_exception_type, before_sleep_log, wait_exponential
 
 from alpha_evolve_evaluator.evaluator import EvalResult, BaseConfig
 from protocols import logger
@@ -145,22 +146,21 @@ def build_feedback_prompt(
     )
     return header + "\n".join(questions_str) + tail
 
-sem_wiki = asyncio.Semaphore(1)
+sem_wiki = asyncio.Semaphore(50)
 
+@retry(
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    stop=stop_after_attempt(200),
+)
 async def safe_retrieve(retrieve_fn, query, retries=200, delay=1):
-  async with sem_wiki:
-    for attempt in range(retries):
-        if query == None:
-            logger.info(f"[Retrieve error], query is {query}")
-            return []  # 最终失败返回空
-        try:
-            return retrieve_fn(query).passages
-        except Exception as e:
-            if attempt < retries - 1:
-                await asyncio.sleep(delay) # 随机等待，避免雪崩
-            else:
-                logger.info(f"[Retrieve error] {e}, query {query}, attempt {attempt+1}/{retries}")
-                return []  # 最终失败返回空
+    try:
+        async with sem_wiki:
+            res = retrieve_fn(query).passages
+            await asyncio.sleep(3) # 随机等待，避免雪崩
+            return res
+    except Exception as e:
+        logger.error(f"Exception: {e}")
+        raise e
 
 sem_global = asyncio.Semaphore(80)
 
