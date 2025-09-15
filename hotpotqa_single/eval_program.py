@@ -8,8 +8,6 @@ import time
 from dataclasses import dataclass, field
 from rouge_score import rouge_scorer
 
-from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_not_exception_type, retry_if_exception_type, before_sleep_log, wait_exponential
-
 from alpha_evolve_evaluator.evaluator import EvalResult, BaseConfig
 from protocols import logger
 
@@ -146,23 +144,16 @@ def build_feedback_prompt(
     )
     return header + "\n".join(questions_str) + tail
 
-sem_wiki = asyncio.Semaphore(50)
-
-@retry(
-    wait=wait_exponential(multiplier=1, min=1, max=5),
-    stop=stop_after_attempt(200),
-)
-async def safe_retrieve(retrieve_fn, query, retries=200, delay=1):
-    try:
-        async with sem_wiki:
-            res = retrieve_fn(query).passages
-            await asyncio.sleep(3) # 随机等待，避免雪崩
-            return res
-    except Exception as e:
-        logger.error(f"Exception: {e}")
-        raise e
-
-sem_global = asyncio.Semaphore(80)
+def safe_retrieve(retrieve_fn, query, retries=200, delay=1):
+    for attempt in range(retries):
+        try:
+            return retrieve_fn(query).passages
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(delay) # 随机等待，避免雪崩
+            else:
+                logger.info(f"[Retrieve error] {e}, query {query}, attempt {attempt+1}/{retries}")
+                return []  # 最终失败返回空
 
 class HotpotQA_HoverMultiHop(dspy.Module):
     def __init__(self,top_k):
@@ -174,40 +165,25 @@ class HotpotQA_HoverMultiHop(dspy.Module):
         self.summarize1 = dspy.ChainOfThought("question,passages->summary")
         self.summarize2 = dspy.ChainOfThought("question,context,passages->summary")
 
-    async def aforward(self, question):
-      async with sem_global:
+    def forward(self, question):
         # HOP 1
-        hop1_docs = await safe_retrieve(self.retrieve_k, question)
+        hop1_docs = safe_retrieve(self.retrieve_k, question)
         hop1_docs = ' '.join([str(i+1)+". " + hop1_docs[i] for i in range(len(hop1_docs))])
-        try:
-            summary_1 = await self.summarize1(
-                question=question, passages=hop1_docs
-            ).summary  # Summarize top k docs
-        except:
-            summary_1 = "Warning: Repetition phenomenon occurred, output is incomplete."
+        summary_1 = self.summarize1(
+            question=question, passages=hop1_docs
+        ).summary  # Summarize top k docs
 
         # HOP 2
-        try:
-            hop2_query = await self.create_query_hop2(question=question, summary_1=summary_1).query
-        except:
-            hop2_query = "Warning: Repetition phenomenon occurred, output is incomplete."
-
-        hop2_docs = await safe_retrieve(self.retrieve_k, hop2_query)
+        hop2_query = self.create_query_hop2(question=question, summary_1=summary_1).query
+        hop2_docs = safe_retrieve(self.retrieve_k, hop2_query)
         hop2_docs = ' '.join([str(i+1)+". " + hop2_docs[i] for i in range(len(hop2_docs))])
-        try:
-            summary_2 = await self.summarize2(
-                question=question, context=summary_1, passages=hop2_docs
-            ).summary
-        except:
-            summary_2 = "Warning: Repetition phenomenon occurred, output is incomplete."
+        summary_2 = self.summarize2(
+            question=question, context=summary_1, passages=hop2_docs
+        ).summary
 
-        try:
-            answer = await self.final_answer(
-                question=question, summary_1=summary_1, summary_2=summary_2
-            ).answer
-        except:
-            answer = "Warning: Repetition phenomenon occurred, output is incomplete."
-
+        answer = self.final_answer(
+            question=question, summary_1=summary_1, summary_2=summary_2
+        ).answer
 
         return {"hop1_docs":hop1_docs,"summary_1":summary_1,"hop2_query":hop2_query,"hop2_docs":hop2_docs,"summary_2":summary_2,"answer":answer}
 
@@ -229,7 +205,7 @@ async def get_hotpotqa_response_per_sys_priompt(user_prompt, answer, sys_prompt,
     system.final_answer.predict.signature.instructions = sys_prompt_4
 
     # 如果 system 是同步的，用 asyncio.to_thread
-    res = await system.aforward(user_prompt)
+    res = await asyncio.to_thread(system, user_prompt)
     if res["answer"] == None:
         res["answer"] = "Warning: Repetition phenomenon occurred, output is incomplete."
 
@@ -248,76 +224,7 @@ async def get_response_major_voting(i, sampled_user_prompts, sampled_answers, sy
     if len(system_prompts) == 1:
         group_answers[i] = res_s[0]['answer']
     else:
-    #     integrated_prompt = f"""
-    #  You have a question and several LLM answers. 
-    #  Your task is to select the answer that appears most frequently (majority answer), and concise final answer in the following format:
-
-    # **Final Answer:** <your answer here>
-
-    # Question:
-    # {user_prompt}
-
-    # LLM Answers:
-    # {" ".join(f"{i+1}. {d['answer']}" for i, d in enumerate(res_s))}
-    # """
-    #     # lm 同步，用 asyncio.to_thread
-
-    #     group_answer = await asyncio.to_thread(lm, integrated_prompt)
-    #     group_answer = group_answer[0]
-    #     if group_answer == None:
-    #         group_answer = "Warning: Repetition phenomenon occurred, output is incomplete."
-    #     if "**Final Answer:**" in group_answer:
-    #         group_answer = group_answer.split("**Final Answer:**")[1].strip()
-    #     group_answers[i] = group_answer
-        integrated_prompt = f"""
-    You have a question and several LLM answers.
-    Your task is to select the answer that appears most frequently (the majority answer).
-    Only output the **index number** (just the number in LLM Answers, no extra words).
-
-    Question:
-    {user_prompt}
-
-    LLM Answers:
-    {" ".join(f"{i}. {d['answer']}" for i, d in enumerate(res_s))}
-    """
-        # lm 同步，用 asyncio.to_thread
-        group_index = await asyncio.to_thread(lm, integrated_prompt)
-        if group_index[0] == None:
-            group_index = "Warning: Repetition phenomenon occurred, output is incomplete."
-
-        group_index = group_index[0].strip()   # 去掉前后空格换行
-
-        # 提取第一个纯数字
-        match = re.search(r"\d+", group_index)
-        if match and int(match.group()) in range(len(res_s)):
-            group_index = int(match.group())
-        else:
-            # fallback: 选择最短的答案
-            lengths = [len(d['answer']) for d in res_s]
-            group_index = min(range(len(res_s)), key=lambda i: lengths[i])
-
-        group_answer = res_s[group_index]['answer']
-        group_answers[i] = group_answer
-        # print("single:", " ".join(f"{i+1}. {d['answer']}" for i, d in enumerate(res_s)))
-        # print("group:", group_answer)
-        # print("answer:", answer)
-        # print("score:", string_pair_metrics(group_answer, answer))
-        # answers = [d["answer"] for d in res_s]
-        # n = len(answers)
-
-        # avg_f1s = []
-        # for j, ans_j in enumerate(answers):
-        #     scores = []
-        #     for k, ans_k in enumerate(answers):
-        #         if j == k:
-        #             continue
-        #         scores.append(string_pair_metrics(ans_j, ans_k)['f1'])
-        #     avg_f1s.append(sum(scores) / len(scores) if scores else 0.0)
-
-        # # 选择平均 F1 最高的答案
-        # best_idx = max(range(n), key=lambda m: (avg_f1s[m], -len(answers[m])))
-        # group_answer = answers[best_idx]
-        # group_answers[i] = group_answer
+        raise NotImplementedError
 
 
 async def process_feedback(i, sampled_user_prompts, sampled_answers, system_prompts, majority_answers, group_answers, lm, feedbacks):
@@ -359,7 +266,6 @@ async def release_one_group_for_questions(
     dspy.settings.configure(
         lm=lm,
         rm=dspy.ColBERTv2(url=wiki_url),
-        async_mode=True,
     )
 
     # 读取数据
