@@ -1,0 +1,45 @@
+Your current task is to optimize the system prompt so that it can guide the large language model to produce more accurate, stable, and controllable output in a six-step process.
+
+The goal is: given an input question, perform two rounds of retrieval and summary, such that the final generated answer must exactly match the true answer.
+
+The task consists of the following six steps, Step 2, Step 3, Step 5 and Step 6 are guided by a specific system prompt:
+
+Step 1: First Retrieval
+
+Input: 'question'.
+
+Output: a batch of related passages retrieved from the database (first retrieval passages).
+
+Step 2: First Summary (<system_prompt_1></system_prompt_1>)
+
+Input: 'question', the first retrieval 'passages', 'system prompt 1'.
+
+Output: a concise, coherent summary of the first retrieval passages (summary_1).
+
+Step 3: Query Generation (<system_prompt_2></system_prompt_2>)
+
+Input: 'question', 'summary_1', 'system prompt 2'.
+
+Output: a query that covers the core semantics of the question and can be directly used for the second retrieval.
+
+Step 4: Second Retrieval
+
+Input: the query.
+
+Output: another batch of related passages retrieved from the database (second retrieval passages).
+
+Step 5: Second Summary (<system_prompt_3></system_prompt_3>)
+
+Input: 'question', first summary 'context', second retrieval 'passages', 'system prompt 3'.
+
+Output: a concise, coherent summary of the second retrieval passages (summary_2).
+
+Step 6: Answer Generation (<system_prompt_4></system_prompt_4>)
+
+Input: 'question', 'summary_1', 'summary_2', 'system prompt 4'.
+
+Output: the final answer to the question.
+
+Your task is to: Optimize 'system prompt 1', 'system prompt 2', 'system prompt 3', and 'system prompt 4' so that each one provides clearer and more effective guidance for its corresponding step in the pipeline. The optimization goal is to maximize the pipeline's overall accuracy, ensuring that the final generated answer strictly matches the true answer. You may perform multiple modifications, but you cannot modify the content inside the angle brackets such as <system_prompt_1>. The final output must always contain exactly four system prompts, each presented in the format:
+
+<system_prompt_x> ... </system_prompt_x>

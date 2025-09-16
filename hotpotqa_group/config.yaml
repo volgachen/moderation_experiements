@@ -1,0 +1,242 @@
+worker_nums: 3
+max_iterations: 75
+prompt:
+  role_desc: |
+    You are a prompt expert.
+  user_message_template: |
+    def obtain_user_message(task_desc, parent_program, insights):
+        feedback_str = parent_program["feedback"].split("==^&*(split-part)==")[0]
+        return f'''
+    You should write prompts to accomplish the following task:
+    <task_description>
+    {task_desc}
+    </task_description>
+
+    Here is a previous version:
+    <program_candidate>
+    <program>
+    {parent_program['program']}
+    </program>
+    <eval_result>
+    metrics:
+    - f1 score: {parent_program['metrics']['f1']}
+    - recall: {parent_program['metrics']['recall']}
+    feedback:
+    {feedback_str}
+    </eval_result>
+    </program_candidate>
+
+    To achieve the task, please propose modifications to the program_candidate. Describe each change with a SEARCH/REPLACE block described as following:
+    <<<<<<< SEARCH
+    [Original code lines]
+    =======
+    [Modified code lines]
+    >>>>>>> REPLACE
+    '''
+  diff_mode: true
+  program_checker: |
+    def check_program(program):
+        return 4 == len(re.findall(r"<system_prompt_\d+>.*?</system_prompt_\d+>", program, flags=re.DOTALL))
+
+sample:
+  num: 1
+  method: island
+islands:
+  num_islands: 3           # 总共有 5 个岛屿
+  reset_interval: 400  # 每 30 步重置一次岛屿
+  migration_interval: 400    # 每 10 步做一次迁移
+  migration_ratio: 0.0     # 迁移比例（0% 个体）
+  population_limit: 11    # 每个岛屿最多保存 10 个个体
+  remove_policy: definite
+  include_metrics: 
+    - f1   # 岛屿使用的主要评价指标
+  limit_all_population: false
+  init_from_job_id: 2481
+
+evaluation:
+  addrs:
+    - http://10.10.1.129:9000
+  metrics:
+    - name: f1
+      expected: 1.0
+      higher_is_better: true
+  cpu_bound: true
+  worker_nums: 10
+  timeout_secs: 4800
+llm_ensemble:
+  - name: gpt-4.1-mini
+    weight: 1
+
+custom_config:
+  model_name: openai/gpt-4.1-mini
+
+iteration_hook_interval: 3
+iteration_hook_run_at_start: true
+iteration_hook_function: |
+    import os
+    import asyncio
+    import psycopg2
+    from psycopg2.extras import DictCursor
+    from datetime import datetime
+    from repositories.island_persistence import get_job_active_programs
+
+    import logging
+    logger = logging.getLogger(__name__)
+
+    def _get_programs(connection, ids):
+        cursor = connection.cursor(cursor_factory=DictCursor)
+
+        cursor.execute("SELECT * FROM programs WHERE id = ANY(%s)", (ids,))
+        programs = cursor.fetchall()
+        cursor.close()
+        return programs
+
+    def _get_all_validation_results(program):
+        val_results = program["feedback"].split('==^&*(split-part)==')[1]
+        val_results = val_results.split('==^&*(split-val)==')
+        return val_results
+
+    def _update_eval_program_eval(
+        evolver,
+        id: int,
+        feedback,
+        metrics,
+    ):
+        sql = """
+    UPDATE programs SET
+    feedback = %s,
+    metrics = %s,
+    status = 'succeeded',
+    evaluated_at = CURRENT_TIMESTAMP
+    WHERE id = %s
+    """
+        try:
+            with evolver.connection.cursor() as cursor:
+                cursor.execute(
+                    sql,
+                    (feedback, metrics, id),
+                )
+                evolver.connection.commit()
+        except psycopg2.Error as e:
+            if evolver.connection:
+                evolver.connection.rollback()
+            raise e
+
+    async def iteration_hook_func(job_kwargs, next_job=None ):
+        job_id = job_kwargs["job_id"]
+        evolver = job_kwargs["evolver"]
+        islands = job_kwargs["islands"]
+        eval_client = job_kwargs["eval_client"]
+        conf = job_kwargs["conf"]
+
+        db_params = {
+            "dbname": os.getenv("DB_NAME", "evolve"),
+            "user": os.getenv("DB_USER", "postgres"),
+            "password": os.getenv("DB_PASSWORD", "mysecretpassword"),
+            "host": os.getenv("DB_HOST", "10.21.40.5"),
+            "port": os.getenv("DB_PORT", "5432"),
+        }
+        connection = psycopg2.connect(**db_params)
+
+        num_group = 10
+        eval_cfg = evolver._config_with_llm_key(conf, job_id)
+        eval_cfg["enable_feedback"] = True
+        _, pids_per_island = get_job_active_programs(connection, job_id)
+        groups = {}
+        all_pids_lists = []
+        all_eval_tasks = []
+        all_eval_results = []
+
+        async def process_tasks(timeout_secs):
+            if not all_eval_tasks:
+                logger.info("No tasks to process")
+                return
+            logger.info(f"Processing {len(all_eval_tasks)} tasks with {timeout_secs}s timeout")
+            eval_results = await asyncio.wait_for(
+                asyncio.gather(*all_eval_tasks, return_exceptions=True),
+                timeout=timeout_secs
+            )
+            all_eval_results.extend(eval_results)
+            all_eval_tasks.clear()
+
+        for _ in range(num_group):
+            programs, pids_list, val_results = [], [], []
+            for island_id in range(len(pids_per_island)):
+                pids = islands.sample_program(
+                    island_id, 1, higher_is_better=True
+                )
+                pids_list.append((island_id, pids[0]))
+                ps = _get_programs(connection, pids)[0]
+                programs.append(ps["program"])
+                val_result = _get_all_validation_results(ps)
+                val_results.append(val_result)
+            eval_cfg["val_results"] = val_results
+            eval_cfg["programs"] = programs
+
+            eval_task = asyncio.create_task(
+                eval_client.evaluate("", config=eval_cfg, context={"job_id": job_id}),
+                name=f"job-{job_id}-evaluation",
+            )
+            all_pids_lists.append(pids_list)
+            all_eval_tasks.append(eval_task)
+            if len(all_eval_tasks) >= 5:
+                await process_tasks( conf.evaluation.timeout_secs)
+        await process_tasks( conf.evaluation.timeout_secs)
+
+        for eval_result, pids_list in zip(all_eval_results, all_pids_lists):
+            # Handle exceptions if any evaluation failed
+            if isinstance(eval_result, Exception):
+                raise eval_result
+            feedbacks = eval_result.feedback.split("==^&*(split-feedback)==")
+            metrics = eval_result.metrics
+            # 
+            for i in range(len(pids_list)):
+                pids = pids_list[i]
+                if pids not in groups:
+                    groups[pids] = {"metrics": [], "feedbacks": []}
+                groups[pids]["metrics"].append(metrics)
+                groups[pids]["feedbacks"].append(feedbacks[i])
+            logger.info(f"Evaluated, group {pids_list}")
+
+        updated_results = {}
+        for (island_id, pid), group in groups.items():
+            metrics = group["metrics"]
+            feedbacks = group["feedbacks"]
+
+            metric_keys = metrics[0].keys()
+            avg_scores = {
+                k: sum(m[k] for m in metrics) / len(metrics)
+                for k in metric_keys
+            }
+                
+            origin_score = _get_programs(connection, [pid])[0]["metrics"]
+
+            final_metric = {}
+            ps = _get_programs(connection, [pid])[0]
+            is_new_program = not ps["feedback"].startswith("This system prompt has been used in different groups")
+            if is_new_program:
+                final_metric = avg_scores
+            else:
+                for k in metric_keys:
+                    final_metric[k] = (
+                        0.8 * origin_score[k]
+                        + 0.2 * avg_scores[k]
+                    )
+            current_time = datetime.now()
+            formatted_time = current_time.strftime("%Y-%m-%d %H:%M:%S")
+            logs = f"{formatted_time} - logger - INFO - This pid is in several groups, with the following metrics:\n:{'\n'.join([str(me) for me in metrics])}\n, AVG_score: {avg_scores} \n Final metrics: {final_metric}"
+
+            feedback_str = "This system prompt has been used in different groups, and received the following feedbacks:\n"
+            for i, fb in enumerate(feedbacks, 1):
+                feedback_str += f"feedback {i}:\n{fb}\n"
+            feedback_str = feedback_str + "==^&*(split-part)==" + ps["feedback"].split("==^&*(split-part)==")[1]
+            _update_eval_program_eval(evolver, pid, feedback = feedback_str, metrics=final_metric)
+            evolver._append_program_log(pid, logs)
+            logger.info(f"Updated eval results for {pid}")
+        connection.close()
+
+        for island_id in range(3):
+            if islands._count_programs_in_island(island_id) > 10:
+                islands._remove_program_worst_sample(island_id=island_id)
+
+        return updated_results
