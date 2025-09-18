@@ -51,7 +51,7 @@ islands:
   include_metrics: 
     - f1   # 岛屿使用的主要评价指标
   limit_all_population: false
-  init_from_job_id: 2481
+  init_from_job_id: 2329
 
 evaluation:
   addrs:
@@ -70,6 +70,7 @@ llm_ensemble:
 custom_config:
   model_name: openai/gpt-4.1-mini
 
+tolerate_same_program: true # HACK current evolver has a bug that the flag is wrong
 iteration_hook_interval: 3
 iteration_hook_run_at_start: true
 iteration_hook_function: |
@@ -224,12 +225,13 @@ iteration_hook_function: |
                     )
             current_time = datetime.now()
             formatted_time = current_time.strftime("%Y-%m-%d %H:%M:%S")
-            logs = f"{formatted_time} - logger - INFO - This pid is in several groups, with the following metrics:\n:{'\n'.join([str(me) for me in metrics])}\n, AVG_score: {avg_scores} \n Final metrics: {final_metric}"
+            logs = f"{formatted_time} - logger - INFO - This pid is in several groups, with the following metrics:\n{'\n'.join([str(me) for me in metrics])}\n, AVG_score: {avg_scores} \n Final metrics: {final_metric}"
 
             feedback_str = "This system prompt has been used in different groups, and received the following feedbacks:\n"
             for i, fb in enumerate(feedbacks, 1):
                 feedback_str += f"feedback {i}:\n{fb}\n"
             feedback_str = feedback_str + "==^&*(split-part)==" + ps["feedback"].split("==^&*(split-part)==")[1]
+            islands._islands[island_id]._metrics_map[pid] = final_metric
             _update_eval_program_eval(evolver, pid, feedback = feedback_str, metrics=final_metric)
             evolver._append_program_log(pid, logs)
             logger.info(f"Updated eval results for {pid}")
