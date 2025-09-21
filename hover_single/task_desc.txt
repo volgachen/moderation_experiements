@@ -33,13 +33,3 @@ Output: a query that captures the core semantics of the claim and can be directl
 Step 7: Final Retrieval
 Input: the query.
 Output: final batch of related passages retrieved from the database (third retrieval passages).
-
-Your task:
-
-Optimize system_prompt_1, system_prompt_2, system_prompt_3, and system_prompt_4 to provide clearer, more effective guidance for their corresponding steps.
-
-Ensure overall accuracy is maximized, so that all true passages are contained in the final three retrieval results.
-
-You may perform multiple iterations of improvement, but you cannot modify content inside angle brackets such as <system_prompt_1>.
-
-The final output must contain exactly four system prompts, each in the format: <system_prompt_x> ... </system_prompt_x>.

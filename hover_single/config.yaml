@@ -7,21 +7,27 @@ prompt:
     def obtain_user_message(task_desc, parent_program, insights):
         feedback_str = parent_program["feedback"].split("==^&*(split-part)==")[0]
         return f'''
-    You should write prompts to accomplish the following task:
     <task_description>
     {task_desc}
     </task_description>
-    We call a group of four system prompts that satisfying the requirements in <task_description> a program.
 
-    Here is a previous version we have tried before:
+    We call a group of four system prompts that satisfying the requirements in <task_description> a program, and we are iteratively refining programs to pursue higher performance on this task.
+    Here is a previous version:
     <program>
     {parent_program['program']}
     </program>
-    When evaluating these system prompts on the metric set, we get the following results:
+    When evaluating these system prompts on a validation set to calculate the metric, we get the following results:
     - accuracy: {parent_program['metrics']['acc']}. This metric is defined as the proportion of queries for which the program successfully retrieves all required target passages.
 
     To understand how the program succeeds or fails, we conducted a reflective analysis. We presented an advanced LLM with full response trajectories and tasked it with self-critique. The output is a set of insights into systemic weaknesses and concrete suggestions for improvement, summarized below:
     {feedback_str}
+
+    # Your task
+
+    Optimize <system_prompt_1>, <system_prompt_2>, <system_prompt_3>, and <system_prompt_4> to provide clearer, more effective guidance for their corresponding steps.
+    Ensure overall accuracy is maximized, so that all true passages are contained in the final three retrieval results.
+    You may perform multiple iterations of improvement, but you cannot modify content inside angle brackets such as <system_prompt_1>.
+    The program must always contain exactly four system prompts, each in the format: <system_prompt_x> ... </system_prompt_x>.
 
     To achieve the task, please propose modifications to the old <program>. The only modification you can make is replacement, i.e., replacing [Original code lines] with [Modified code lines]. Please describe each change with a SEARCH/REPLACE block described as following:
     <<<<<<< SEARCH
@@ -59,7 +65,7 @@ evaluation:
       higher_is_better: true
   cpu_bound: true
   worker_nums: 10
-  timeout_secs: 4800
+  timeout_secs: 9600
 llm_ensemble:
   - name: gpt-4.1-mini
     weight: 1
