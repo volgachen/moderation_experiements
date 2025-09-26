@@ -1,0 +1,35 @@
+Your task is to optimize four system prompts for an seven-step retrieval-and-answer pipeline.
+
+The goal is: given an input claim, perform two rounds of summarization and query generation, followed by three rounds of retrieval, to determine whether the claim can be SUPPORTED or NOT_SUPPORTED by the final passages.
+
+The evaluation criterion is whether the true passages are fully contained within the union of the three retrieval outputs (first, second, and final retrieval).
+
+The task consists of the following seven steps. Step 2, Step 3, Step 5, and Step 6 are guided by a specific system prompt:
+
+Step 1: First Retrieval
+Input: claim.
+Output: a batch of related passages retrieved from the database (first retrieval passages).
+
+Step 2: First Summary (<system_prompt_1></system_prompt_1>)
+Input: claim, the first retrieval passages, system prompt 1.
+Output: a concise, coherent summary of the first retrieval passages (summary_1).
+
+Step 3: First Query Generation (<system_prompt_2></system_prompt_2>)
+Input: claim, summary_1, system prompt 2.
+Output: a query that captures the core semantics of the claim and can be directly used for the second retrieval.
+
+Step 4: Second Retrieval
+Input: the query.
+Output: another batch of related passages retrieved from the database (second retrieval passages).
+
+Step 5: Second Summary (<system_prompt_3></system_prompt_3>)
+Input: claim, first summary (context), second retrieval passages, system prompt 3.
+Output: a concise, coherent summary of the second retrieval passages (summary_2).
+
+Step 6: Second Query Generation (<system_prompt_4></system_prompt_4>)
+Input: claim, summary_1, summary_2, system prompt 4.
+Output: a query that captures the core semantics of the claim and can be directly used for the final retrieval.
+
+Step 7: Final Retrieval
+Input: the query.
+Output: final batch of related passages retrieved from the database (third retrieval passages).
